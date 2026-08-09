@@ -9,11 +9,13 @@ import os
 import io
 import base64
 import json
-import hashlib
 import asyncio
 import logging
+import re
+from html import unescape
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+import httpx
 
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
@@ -35,6 +37,10 @@ BOT_TOKEN = (
 ADMIN_IDS      = [5471930058, 7147520184]
 OWNER_ID       = 5471930058
 SIGNAL_CHANNEL = "saytalone_alpha_reverse_trx"   # without @
+SIGNAL_CHANNEL_URL = os.getenv(
+    "SIGNAL_CHANNEL_URL",
+    f"https://t.me/s/{SIGNAL_CHANNEL}",
+)
 
 # All files are resolved relative to bot.py, so Railway can start the bot from
 # any working directory.
@@ -64,6 +70,8 @@ def image_file(name: str) -> io.BytesIO:
 CHANNEL_SIG_MAX_AGE_MIN = 15
 ANTI_STREAK_COUNT       = 3
 FREE_DAILY_SECONDS      = 60 * 60
+CHANNEL_FETCH_TIMEOUT_SECONDS = 12
+CHANNEL_CACHE_MAX_AGE_MIN = 3
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -259,8 +267,13 @@ def count_free_access() -> int:
 
 # ── Channel signal storage ─────────────────────────────────────────────────────
 
-def save_channel_signal(signal: str):
-    data = {"signal": signal, "timestamp": datetime.now(timezone.utc).isoformat()}
+def save_channel_signal(signal: str, source_timestamp: str | None = None):
+    data = {
+        "signal": signal,
+        "timestamp": source_timestamp or datetime.now(timezone.utc).isoformat(),
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "source_timestamp": source_timestamp,
+    }
     temp = CHANNEL_SIG_FILE.with_suffix(".tmp")
     temp.write_text(json.dumps(data))
     temp.replace(CHANNEL_SIG_FILE)
@@ -273,19 +286,73 @@ def get_channel_signal() -> str | None:
         data = json.loads(CHANNEL_SIG_FILE.read_text())
         ts   = datetime.fromisoformat(data["timestamp"])
         age  = (datetime.now(timezone.utc) - ts).total_seconds() / 60
-        if age <= CHANNEL_SIG_MAX_AGE_MIN:
+        if age <= CHANNEL_CACHE_MAX_AGE_MIN:
             return data["signal"]
     except Exception:
         pass
     return None
 
 def parse_signal_from_text(text: str) -> str | None:
-    upper = text.upper()
-    if "BIG" in upper:
-        return "BIG"
-    if "SMALL" in upper:
-        return "SMALL"
+    cleaned = unescape(re.sub(r"<[^>]+>", " ", text)).upper()
+    matches = re.findall(r"\b(BIG|SMALL)\b", cleaned)
+    if matches:
+        return matches[-1]
     return None
+
+def _parse_public_channel_posts(page: str) -> list[tuple[datetime, str]]:
+    """Extract signal text and its public post time from t.me/s HTML."""
+    texts = re.findall(
+        r'<div class="tgme_widget_message_text js-message_text"[^>]*>(.*?)</div>',
+        page,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    times = re.findall(r'<time datetime="([^"]+)"', page, flags=re.IGNORECASE)
+    posts: list[tuple[datetime, str]] = []
+    for raw_text, raw_time in zip(texts, times):
+        signal = parse_signal_from_text(raw_text)
+        if not signal:
+            continue
+        try:
+            post_time = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if post_time.tzinfo is None:
+            post_time = post_time.replace(tzinfo=timezone.utc)
+        posts.append((post_time.astimezone(timezone.utc), signal))
+    return posts
+
+async def fetch_latest_public_channel_signal() -> str | None:
+    """Read the latest signal from the public channel preview; no admin rights required."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=CHANNEL_FETCH_TIMEOUT_SECONDS,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 signal-bot-public-reader"},
+        ) as client:
+            response = await client.get(SIGNAL_CHANNEL_URL)
+            response.raise_for_status()
+        posts = _parse_public_channel_posts(response.text)
+        if not posts:
+            logger.warning("No BIG/SMALL signal found in public channel preview")
+            return None
+        post_time, source_signal = max(posts, key=lambda item: item[0])
+        age_minutes = (datetime.now(timezone.utc) - post_time).total_seconds() / 60
+        if age_minutes > CHANNEL_SIG_MAX_AGE_MIN:
+            logger.warning(
+                "Latest public channel signal is stale: %.1f minutes old",
+                age_minutes,
+            )
+            return None
+        save_channel_signal(source_signal, source_timestamp=post_time.isoformat())
+        logger.info(
+            "Public channel signal read: %s at %s",
+            source_signal,
+            post_time.isoformat(),
+        )
+        return source_signal
+    except (httpx.HTTPError, OSError) as error:
+        logger.warning("Could not read public channel preview: %s", error)
+        return get_channel_signal()
 
 # ── Signal history / anti-streak ───────────────────────────────────────────────
 
@@ -314,29 +381,19 @@ def get_recent_streak() -> tuple[str, int]:
 
 # ── Core signal generator ──────────────────────────────────────────────────────
 
-def generate_signal(txn_no: str) -> str:
-    # 1. Channel signal reversed
-    ch_sig = get_channel_signal()
-    if ch_sig:
-        signal = "SMALL" if ch_sig == "BIG" else "BIG"
-        logger.info(f"Channel reversal: {ch_sig} → {signal}")
-        save_signal_to_history(signal)
-        return signal
+async def generate_signal(txn_no: str) -> str | None:
+    """Return the reverse of the latest public source signal.
 
-    # 2. Anti-streak
-    last_sig, streak = get_recent_streak()
-    if streak >= ANTI_STREAK_COUNT and last_sig:
-        signal = "SMALL" if last_sig == "BIG" else "BIG"
-        logger.info(f"Anti-streak flip after {streak}× {last_sig} → {signal}")
-        save_signal_to_history(signal)
-        return signal
-
-    # 3. Hash fallback
-    now    = datetime.now(timezone.utc)
-    seed   = f"{txn_no.strip()}|{now.strftime('%Y%m%d%H%M')}"
-    digest = hashlib.sha256(seed.encode()).hexdigest()
-    val    = int(digest[:8], 16)
-    signal = "BIG" if val % 2 == 0 else "SMALL"
+    There is intentionally no random or hash fallback. A missing source signal
+    must never become a fabricated trading direction.
+    """
+    del txn_no
+    ch_sig = await fetch_latest_public_channel_signal()
+    if not ch_sig:
+        logger.warning("Reverse signal unavailable because source signal is unavailable")
+        return None
+    signal = "SMALL" if ch_sig == "BIG" else "BIG"
+    logger.info("Public channel reversal: %s → %s", ch_sig, signal)
     save_signal_to_history(signal)
     return signal
 
@@ -661,7 +718,21 @@ async def _send_signal(q, ctx: ContextTypes.DEFAULT_TYPE):
     if is_free and not start_free_timer(user_id):
         await q.answer("🎁 ဒီနေ့ Free time ကုန်သွားပါပြီ။", show_alert=True)
         return
-    signal     = generate_signal(txn_no)
+    signal     = await generate_signal(txn_no)
+    if not signal:
+        if is_free:
+            pause_free_timer(user_id)
+        await q.answer(
+            "📡 Source channel signal မရသေးပါ။ ခဏစောင့်ပြီး ပြန်စမ်းပါ။",
+            show_alert=True,
+        )
+        await _send_text_retry(
+            ctx.bot,
+            q.message.chat_id,
+            "⚠️ Source channel ရဲ့ latest signal ကို မဖတ်နိုင်သေးပါ။\n"
+            "Random signal မထုတ်ဘဲ source ပြန်ရတဲ့အထိ ခဏစောင့်ပြီး ပြန်တောင်းပေးပါ။",
+        )
+        return
     now_utc    = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     img_name   = "big" if signal == "BIG" else "small"
     signal_txt = "🔴 BIG" if signal == "BIG" else "🔵 SMALL"
