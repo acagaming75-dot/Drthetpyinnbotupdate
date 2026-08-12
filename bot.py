@@ -15,6 +15,7 @@ import re
 from html import unescape
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from urllib.parse import quote
 import httpx
 
 from telegram import (
@@ -53,6 +54,17 @@ SESSIONS_FILE    = DATA_DIR / "sessions.json"
 FREE_FILE        = DATA_DIR / "free_access.json"
 CHANNEL_SIG_FILE = DATA_DIR / "channel_signal.json"
 SIGNAL_HIST_FILE = DATA_DIR / "signal_history.json"
+SOURCE_HIST_FILE = DATA_DIR / "source_history.json"
+USER_ROUNDS_FILE = DATA_DIR / "user_rounds.json"
+
+# The official game result endpoint is not exposed by the public web page in
+# every deployment.  When GAME_HISTORY_URL is supplied, the bot uses it for
+# automatic WIN/LOSS settlement.  The URL may contain {txn}; otherwise the
+# transaction number is also sent as the `txn` query parameter.
+GAME_HISTORY_URL = os.getenv("GAME_HISTORY_URL", "").strip()
+ROUND_SECONDS = 60
+RESULT_GRACE_SECONDS = 8
+COUNTDOWN_UPDATE_SECONDS = 1
 
 # The four bot images are embedded in this file so no images folder is needed.
 EMBEDDED_IMAGES = {
@@ -277,6 +289,18 @@ def save_channel_signal(signal: str, source_timestamp: str | None = None):
     temp = CHANNEL_SIG_FILE.with_suffix(".tmp")
     temp.write_text(json.dumps(data))
     temp.replace(CHANNEL_SIG_FILE)
+    source_hist = load_source_history()
+    if not source_hist or (
+        source_hist[-1].get("signal") != signal
+        or source_hist[-1].get("timestamp") != data["timestamp"]
+    ):
+        source_hist.append({
+            "signal": signal,
+            "timestamp": data["timestamp"],
+        })
+    temp = SOURCE_HIST_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(source_hist[-120:], indent=2))
+    temp.replace(SOURCE_HIST_FILE)
     logger.info(f"📡 Channel signal saved: {signal}")
 
 def get_channel_signal() -> str | None:
@@ -291,6 +315,402 @@ def get_channel_signal() -> str | None:
     except Exception:
         pass
     return None
+
+
+def load_source_history() -> list:
+    try:
+        data = json.loads(SOURCE_HIST_FILE.read_text()) if SOURCE_HIST_FILE.exists() else []
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.warning("Could not read source history: %s", e)
+        return []
+
+
+def load_user_rounds() -> dict:
+    try:
+        data = json.loads(USER_ROUNDS_FILE.read_text()) if USER_ROUNDS_FILE.exists() else {}
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.warning("Could not read user round history: %s", e)
+        return {}
+
+
+def save_user_rounds(data: dict):
+    temp = USER_ROUNDS_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    temp.replace(USER_ROUNDS_FILE)
+
+
+def _user_rounds(user_id: int) -> list:
+    data = load_user_rounds()
+    rounds = data.get(str(user_id), [])
+    return rounds if isinstance(rounds, list) else []
+
+
+def save_user_round(
+    user_id: int,
+    txn_no: str,
+    signal: str,
+    badge: str,
+    confidence: int,
+    issued_at: datetime,
+    round_end: datetime,
+) -> str:
+    """Persist a prediction before sending it so results survive restarts."""
+    round_id = issued_at.strftime("%Y%m%d%H%M%S%f")
+    data = load_user_rounds()
+    rounds = data.setdefault(str(user_id), [])
+    rounds.append({
+        "id": round_id,
+        "transaction": txn_no,
+        "signal": signal,
+        "badge": badge,
+        "confidence": confidence,
+        "issued_at": issued_at.isoformat(),
+        "round_end": round_end.isoformat(),
+        "status": "OPEN",
+        "result": None,
+        "actual": None,
+        "settled_at": None,
+        "settled_by": None,
+        "message_id": None,
+        "chat_id": user_id,
+    })
+    data[str(user_id)] = rounds[-100:]
+    save_user_rounds(data)
+    return round_id
+
+
+def update_user_round(user_id: int, round_id: str, **changes) -> dict | None:
+    data = load_user_rounds()
+    rounds = data.get(str(user_id), [])
+    for item in rounds:
+        if item.get("id") == round_id:
+            item.update(changes)
+            save_user_rounds(data)
+            return item
+    return None
+
+
+def get_user_round(user_id: int, round_id: str) -> dict | None:
+    for item in _user_rounds(user_id):
+        if item.get("id") == round_id:
+            return item
+    return None
+
+
+def open_rounds(user_id: int) -> list:
+    now = datetime.now(timezone.utc)
+    return [
+        item for item in _user_rounds(user_id)
+        if item.get("status") == "OPEN"
+        and _parse_utc(item.get("round_end")) > now
+    ]
+
+
+def _parse_utc(value: str | None) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value or "")
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+
+def user_stats(user_id: int) -> tuple[int, int, int, float]:
+    rounds = _user_rounds(user_id)
+    wins = sum(1 for item in rounds if item.get("result") == "WIN")
+    losses = sum(1 for item in rounds if item.get("result") == "LOSS")
+    total = wins + losses
+    rate = (wins / total * 100) if total else 0.0
+    return wins, losses, total, rate
+
+
+def result_from_value(value) -> tuple[str | None, str | None]:
+    """Convert common lottery API result shapes to BIG/SMALL."""
+    if value is None:
+        return None, None
+    if isinstance(value, bool):
+        return None, None
+    if isinstance(value, (int, float)) or (
+        isinstance(value, str) and re.fullmatch(r"\d+", value.strip())
+    ):
+        number = int(value)
+        if 0 <= number <= 9:
+            return ("BIG" if number >= 5 else "SMALL"), str(number)
+        return None, str(number)
+    text = str(value).upper()
+    if re.search(r"\bBIG\b", text):
+        return "BIG", None
+    if re.search(r"\bSMALL\b", text):
+        return "SMALL", None
+    return None, None
+
+
+def _walk_result_records(value):
+    """Yield dictionaries from nested JSON returned by different game sites."""
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_result_records(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_result_records(child)
+
+
+def _result_for_transaction(payload, txn_no: str) -> tuple[str | None, str | None]:
+    txn = str(txn_no).strip()
+    for item in _walk_result_records(payload):
+        identifiers = " ".join(
+            str(item.get(key, "")) for key in (
+                "transaction", "transactionNo", "transaction_no",
+                "period", "issue", "issueNumber", "round", "roundNo",
+                "id", "gameId",
+            )
+        )
+        if txn not in identifiers:
+            continue
+        for key in ("result", "number", "num", "openNumber", "winningNumber", "value", "code"):
+            if key in item:
+                direction, actual = result_from_value(item[key])
+                if direction:
+                    return direction, actual
+        direction, actual = result_from_value(item)
+        if direction:
+            return direction, actual
+    return None, None
+
+
+async def fetch_game_result(txn_no: str) -> tuple[str | None, str | None]:
+    """Best-effort result lookup; unavailable endpoints never create a result."""
+    if not GAME_HISTORY_URL:
+        return None, None
+    url = GAME_HISTORY_URL.replace("{txn}", quote(str(txn_no), safe=""))
+    params = {} if "{txn}" in GAME_HISTORY_URL else {
+        "txn": txn_no,
+        "transactionNo": txn_no,
+        "period": txn_no,
+        "issue": txn_no,
+    }
+    try:
+        async with httpx.AsyncClient(
+            timeout=CHANNEL_FETCH_TIMEOUT_SECONDS,
+            follow_redirects=True,
+            headers={"User-Agent": "DrThetPyinnSignalBot/2.0"},
+        ) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = response.text
+        return _result_for_transaction(payload, txn_no)
+    except (httpx.HTTPError, OSError) as error:
+        logger.warning("Could not read game result for %s: %s", txn_no, error)
+        return None, None
+
+
+def signal_quality(signal: str) -> tuple[str, int]:
+    """Give a transparent confidence label from available history only."""
+    source = [x.get("signal") for x in load_source_history()[-12:] if x.get("signal") in {"BIG", "SMALL"}]
+    predicted = [x for x in load_signal_history()[-12:] if x.get("signal") in {"BIG", "SMALL"}]
+    confidence = 50
+    if len(source) >= 3:
+        same = sum(1 for item in source[-3:] if item == source[-1])
+        confidence += same * 4
+    if predicted:
+        settled = [x for x in predicted if x.get("result") in {"WIN", "LOSS"}]
+        if settled:
+            wins = sum(1 for x in settled if x.get("result") == "WIN")
+            confidence += round((wins / len(settled) - 0.5) * 20)
+    confidence = max(50, min(78, confidence))
+    badge = "Strong" if confidence >= 68 else "Medium" if confidence >= 58 else "Weak"
+    return badge, confidence
+
+
+def format_countdown(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
+
+def stats_text(user_id: int) -> str:
+    wins, losses, total, rate = user_stats(user_id)
+    open_count = len(open_rounds(user_id))
+    return (
+        "📈 *My Signal Record*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"✅ WIN       : {wins}\n"
+        f"❌ LOSS      : {losses}\n"
+        f"🎮 Completed : {total}\n"
+        f"🏆 Win rate  : {rate:.1f}%\n"
+        f"⏳ Active    : {open_count}\n\n"
+        "Win rate သည် သင်မှတ်တမ်းတင်ထားသော result များကိုသာ အခြေခံထားပါသည်။"
+    )
+
+
+def parse_transaction_from_text(text: str) -> str | None:
+    cleaned = unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    match = re.search(
+        r"(?:TRANSACTION(?:\s+NO\.?)?|TXN|ROUND(?:\s+ID)?|PERIOD|ISSUE)"
+        r"\s*[:#-]?\s*(\d{8,})",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1) if match else None
+
+
+def parse_result_from_text(text: str) -> tuple[str | None, str | None]:
+    """Only parse an outcome when the post explicitly labels it as a result."""
+    cleaned = unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    match = re.search(
+        r"(?:RESULT|OPEN(?:ING)?\s+NUMBER|WINNING\s+NUMBER|ACTUAL)"
+        r"\s*[:#-]?\s*(BIG|SMALL|\d+)",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return result_from_value(match.group(1)) if match else (None, None)
+
+
+async def settle_channel_result(bot, transaction: str, direction: str, actual: str | None):
+    """Settle every user's open prediction for an explicitly labelled result post."""
+    for user_id, rounds in load_user_rounds().items():
+        for item in rounds if isinstance(rounds, list) else []:
+            if (
+                item.get("status") == "OPEN"
+                and str(item.get("transaction", "")).strip() == str(transaction).strip()
+            ):
+                result = "WIN" if item.get("signal") == direction else "LOSS"
+                updated = update_user_round(
+                    int(user_id),
+                    item.get("id", ""),
+                    status=result,
+                    result=result,
+                    actual=actual or direction,
+                    settled_at=datetime.now(timezone.utc).isoformat(),
+                    settled_by="telegram_source",
+                )
+                settle_signal_history(item.get("id", ""), result, actual or direction)
+                if updated and updated.get("message_id"):
+                    try:
+                        await bot.edit_message_caption(
+                            chat_id=updated.get("chat_id", int(user_id)),
+                            message_id=updated["message_id"],
+                            caption=build_round_caption(updated),
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=kb_signal_actions(),
+                        )
+                    except Exception as error:
+                        logger.warning("Could not show channel-settled result: %s", error)
+
+
+def build_round_caption(item: dict, remaining: int | None = None) -> str:
+    signal = item.get("signal", "—")
+    signal_txt = "🔴 BIG" if signal == "BIG" else "🔵 SMALL"
+    status = item.get("status", "OPEN")
+    result = item.get("result")
+    actual = item.get("actual")
+    if result == "WIN":
+        status_line = f"✅ *WIN*  (Result: {actual or signal})"
+    elif result == "LOSS":
+        status_line = f"❌ *LOSS* (Result: {actual or '—'})"
+    elif status == "OPEN" and remaining is not None:
+        status_line = f"⏳ *LIVE*  ({format_countdown(remaining)} remaining)"
+    else:
+        status_line = "📡 *RESULT PENDING*"
+    return (
+        "🎯 *Signal Result*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎮 Transaction no. : `{item.get('transaction', '—')}`\n"
+        "⏱ Timeframe        : 1 Minute\n"
+        f"🕐 Time             : {item.get('issued_at', '')[:19].replace('T', ' ')} UTC\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Direction        : *{signal_txt}*\n"
+        f"🏷 Status           : *{item.get('badge', 'Weak')}*\n"
+        f"🎯 Confidence       : *{item.get('confidence', 50)}%*\n"
+        f"⏱ Round             : {status_line}"
+    )
+
+
+async def settle_round_now(
+    bot,
+    user_id: int,
+    round_id: str,
+    chat_id: int,
+    *,
+    announce_pending: bool = True,
+) -> dict | None:
+    item = get_user_round(user_id, round_id)
+    if not item or item.get("result") in {"WIN", "LOSS"}:
+        return item
+    direction, actual = await fetch_game_result(item.get("transaction", ""))
+    if not direction:
+        if announce_pending:
+            await _send_text_retry(
+                bot,
+                chat_id,
+                "📡 ဒီ round ရဲ့ official result ကို မရသေးပါ။\n"
+                "Result ရလာတဲ့အခါ ပြန်စစ်နိုင်ပါတယ်။",
+            )
+        return item
+    result = "WIN" if direction == item.get("signal") else "LOSS"
+    updated = update_user_round(
+        user_id,
+        round_id,
+        status=result,
+        result=result,
+        actual=actual or direction,
+        settled_at=datetime.now(timezone.utc).isoformat(),
+        settled_by="game_history",
+    )
+    settle_signal_history(round_id, result, actual or direction)
+    if updated:
+        message_id = updated.get("message_id")
+        if message_id:
+            try:
+                await bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption=build_round_caption(updated),
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=kb_signal_actions(round_id),
+                )
+            except Exception as error:
+                logger.warning("Could not update settled signal message: %s", error)
+    return updated
+
+
+async def track_round(bot, user_id: int, round_id: str, chat_id: int):
+    """Keep the Telegram signal message in sync with the 1-minute round."""
+    item = get_user_round(user_id, round_id)
+    if not item:
+        return
+    message_id = item.get("message_id")
+    if not message_id:
+        return
+    end_at = _parse_utc(item.get("round_end"))
+    while True:
+        item = get_user_round(user_id, round_id)
+        if not item or item.get("result") in {"WIN", "LOSS"}:
+            return
+        remaining = int((end_at - datetime.now(timezone.utc)).total_seconds() + 0.999)
+        if remaining <= 0:
+            break
+        try:
+            await bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=build_round_caption(item, remaining),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb_signal_actions(round_id),
+            )
+        except RetryAfter as error:
+            await asyncio.sleep(min(max(1, int(error.retry_after)), 10))
+        except Exception as error:
+            logger.warning("Live countdown update failed: %s", error)
+            await asyncio.sleep(2)
+        else:
+            await asyncio.sleep(COUNTDOWN_UPDATE_SECONDS)
+    await asyncio.sleep(RESULT_GRACE_SECONDS)
+    await settle_round_now(bot, user_id, round_id, chat_id, announce_pending=True)
 
 def parse_signal_from_text(text: str) -> str | None:
     cleaned = unescape(re.sub(r"<[^>]+>", " ", text)).upper()
@@ -364,12 +784,35 @@ def load_signal_history() -> list:
             pass
     return []
 
-def save_signal_to_history(signal: str):
+def save_signal_to_history(
+    signal: str,
+    txn_no: str | None = None,
+    prediction_id: str | None = None,
+):
     hist = load_signal_history()
-    hist.append({"signal": signal, "timestamp": datetime.now(timezone.utc).isoformat()})
+    hist.append({
+        "signal": signal,
+        "transaction": txn_no,
+        "prediction_id": prediction_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "result": None,
+    })
     temp = SIGNAL_HIST_FILE.with_suffix(".tmp")
     temp.write_text(json.dumps(hist[-20:], indent=2))
     temp.replace(SIGNAL_HIST_FILE)
+
+
+def settle_signal_history(prediction_id: str, result: str, actual: str | None):
+    hist = load_signal_history()
+    for item in reversed(hist):
+        if item.get("prediction_id") == prediction_id:
+            item["result"] = result
+            item["actual"] = actual
+            item["settled_at"] = datetime.now(timezone.utc).isoformat()
+            temp = SIGNAL_HIST_FILE.with_suffix(".tmp")
+            temp.write_text(json.dumps(hist[-20:], indent=2))
+            temp.replace(SIGNAL_HIST_FILE)
+            return
 
 def get_recent_streak() -> tuple[str, int]:
     hist = load_signal_history()
@@ -394,7 +837,6 @@ async def generate_signal(txn_no: str) -> str | None:
         return None
     signal = "SMALL" if ch_sig == "BIG" else "BIG"
     logger.info("Public channel reversal: %s → %s", ch_sig, signal)
-    save_signal_to_history(signal)
     return signal
 
 def increment_txn_no(txn_no: str) -> str:
@@ -418,20 +860,33 @@ def kb_vip_required():
 def kb_time_select():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏱ 1m", callback_data="time_1m")]])
 
-def kb_signal_actions():
+def kb_signal_actions(round_id: str | None = None):
+    check_button = (
+        [InlineKeyboardButton("🔍 Check Result", callback_data=f"check_result:{round_id}")]
+        if round_id
+        else []
+    )
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Change ID",  callback_data="change_id"),
         InlineKeyboardButton("➡️ Next Round", callback_data="next_round"),
-    ]])
+    ], [
+        InlineKeyboardButton("📈 My Record", callback_data="my_stats"),
+    ]] + ([check_button] if check_button else []))
 
-def kb_free_signal_actions():
-    return InlineKeyboardMarkup([
+def kb_free_signal_actions(round_id: str | None = None):
+    buttons = [
         [
             InlineKeyboardButton("🔄 Change ID", callback_data="change_id"),
             InlineKeyboardButton("➡️ Next Round", callback_data="next_round"),
         ],
+        [InlineKeyboardButton("📈 My Record", callback_data="my_stats")],
         [InlineKeyboardButton("⏸ Stop Free Timer", callback_data="stop_free")],
-    ])
+    ]
+    if round_id:
+        buttons.insert(2, [
+            InlineKeyboardButton("🔍 Check Result", callback_data=f"check_result:{round_id}")
+        ])
+    return InlineKeyboardMarkup(buttons)
 
 def kb_admin():
     return InlineKeyboardMarkup([
@@ -591,9 +1046,39 @@ async def handle_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     post = update.channel_post or update.edited_channel_post
     if not post:
         return
-    sig = parse_signal_from_text((post.text or post.caption or "").strip())
-    if sig:
-        save_channel_signal(sig)
+    post_text = (post.text or post.caption or "").strip()
+    result_direction, actual = parse_result_from_text(post_text)
+    transaction = parse_transaction_from_text(post_text)
+    if result_direction and transaction:
+        await settle_channel_result(ctx.bot, transaction, result_direction, actual)
+    else:
+        sig = parse_signal_from_text(post_text)
+        if sig:
+            save_channel_signal(sig)
+
+
+async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not has_signal_access(user.id):
+        await _deny_non_vip(update)
+        return
+    for item in _user_rounds(user.id):
+        if (
+            item.get("status") == "OPEN"
+            and _parse_utc(item.get("round_end")) <= datetime.now(timezone.utc)
+        ):
+            await settle_round_now(
+                ctx.bot,
+                user.id,
+                item.get("id", ""),
+                update.effective_chat.id,
+                announce_pending=False,
+            )
+    await update.message.reply_text(
+        stats_text(user.id),
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb_signal_actions(),
+    )
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user  = update.effective_user
@@ -679,6 +1164,13 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "next_round":
         if not has_signal_access(user.id):
             await q.answer("❌ Access မရှိတော့ပါ။ Admin ထံဆက်သွယ်ပါ။", show_alert=True); return
+        if open_rounds(user.id):
+            await q.answer(
+                "⚠️ ပထမကစားပွဲ မပြီးသေးပါ။\n"
+                "1 Minute ပြည့်ပြီး WIN/LOSS ပြပြီးမှ Next Round ပြောင်းပါ။",
+                show_alert=True,
+            )
+            return
         new_txn = increment_txn_no(ctx.user_data.get("txn_no", ""))
         ctx.user_data["txn_no"] = new_txn
         ctx.user_data["state"]  = "selecting_time"
@@ -690,6 +1182,65 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🎮 *Transaction no.:* `{new_txn}`\n\n⏱ *Timeframe ရွေးချယ်ပေးပါ:*",
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_time_select(),
         )
+        return
+
+    if data == "my_stats":
+        if not has_signal_access(user.id):
+            await q.answer("❌ Access မရှိတော့ပါ။ Admin ထံဆက်သွယ်ပါ။", show_alert=True)
+            return
+        for item in _user_rounds(user.id):
+            if item.get("status") == "OPEN" and _parse_utc(item.get("round_end")) <= datetime.now(timezone.utc):
+                await settle_round_now(
+                    ctx.bot,
+                    user.id,
+                    item.get("id", ""),
+                    q.message.chat_id,
+                    announce_pending=False,
+                )
+        if q.message.photo:
+            await q.edit_message_caption(
+                caption=stats_text(user.id),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb_signal_actions(),
+            )
+        else:
+            await q.edit_message_text(
+                text=stats_text(user.id),
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb_signal_actions(),
+            )
+        return
+
+    if data.startswith("check_result:"):
+        if not has_signal_access(user.id):
+            await q.answer("❌ Access မရှိတော့ပါ။ Admin ထံဆက်သွယ်ပါ။", show_alert=True)
+            return
+        round_id = data.split(":", 1)[1]
+        item = get_user_round(user.id, round_id)
+        if not item:
+            await q.answer("❌ ဒီ round မှတ်တမ်း မတွေ့ပါ။", show_alert=True)
+            return
+        if item.get("status") == "OPEN" and _parse_utc(item.get("round_end")) > datetime.now(timezone.utc):
+            remaining = int((_parse_utc(item.get("round_end")) - datetime.now(timezone.utc)).total_seconds() + 0.999)
+            await q.answer(
+                f"⏳ Round မပြီးသေးပါ။ {format_countdown(remaining)} ကျန်ပါသေးတယ်။",
+                show_alert=True,
+            )
+            return
+        updated = await settle_round_now(
+            ctx.bot,
+            user.id,
+            round_id,
+            q.message.chat_id,
+            announce_pending=False,
+        )
+        if updated and updated.get("result") in {"WIN", "LOSS"}:
+            await q.answer(f"{'✅ WIN' if updated['result'] == 'WIN' else '❌ LOSS'} ပြီးပါပြီ။", show_alert=True)
+        else:
+            await q.answer(
+                "📡 Official result မရသေးပါ။ နောက်မှ ပြန်စစ်ပါ။",
+                show_alert=True,
+            )
         return
 
     if data == "stop_free":
@@ -733,28 +1284,47 @@ async def _send_signal(q, ctx: ContextTypes.DEFAULT_TYPE):
             "Random signal မထုတ်ဘဲ source ပြန်ရတဲ့အထိ ခဏစောင့်ပြီး ပြန်တောင်းပေးပါ။",
         )
         return
-    now_utc    = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    img_name   = "big" if signal == "BIG" else "small"
-    signal_txt = "🔴 BIG" if signal == "BIG" else "🔵 SMALL"
-    caption = (
-        "🎯 *Signal Result*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"🎮 Transaction no. : `{txn_no}`\n"
-        f"⏱ Timeframe        : 1 Minute\n"
-        f"🕐 Time             : {now_utc}\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Direction        : *{signal_txt}*"
+    issued_at = datetime.now(timezone.utc)
+    round_end = issued_at + timedelta(seconds=ROUND_SECONDS)
+    badge, confidence = signal_quality(signal)
+    round_id = save_user_round(
+        user_id,
+        txn_no,
+        signal,
+        badge,
+        confidence,
+        issued_at,
+        round_end,
     )
+    save_signal_to_history(signal, txn_no=txn_no, prediction_id=round_id)
+    item = get_user_round(user_id, round_id) or {}
+    img_name   = "big" if signal == "BIG" else "small"
+    caption = build_round_caption(item, ROUND_SECONDS)
     try: await q.message.delete()
     except Exception: pass
     try:
-        await _send_photo_retry(
+        sent = await _send_photo_retry(
             ctx.bot,
             q.message.chat_id,
             "big" if signal == "BIG" else "small",
             caption=caption,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb_free_signal_actions() if is_free else kb_signal_actions(),
+            reply_markup=(
+                kb_free_signal_actions(round_id)
+                if is_free
+                else kb_signal_actions(round_id)
+            ),
+        )
+        update_user_round(
+            user_id,
+            round_id,
+            message_id=sent.message_id,
+            chat_id=q.message.chat_id,
+        )
+        ctx.application.create_task(
+            track_round(ctx.bot, user_id, round_id, q.message.chat_id),
+            update=None,
+            name=f"track-round-{user_id}-{round_id}",
         )
     except Exception:
         logger.exception(f"Could not send signal to {user_id}")
@@ -976,6 +1546,7 @@ async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "Bot စတင်ရန် / ကြိုဆိုစာ"),
         BotCommand("myid",  "သင်၏ Telegram ID ကြည့်ရန်"),
+        BotCommand("stats", "WIN/LOSS နှင့် Win rate ကြည့်ရန်"),
     ])
     for admin_id in ADMIN_IDS:
         await _set_admin_commands(app.bot, admin_id)
@@ -986,6 +1557,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("myid",  cmd_myid))
+    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(
