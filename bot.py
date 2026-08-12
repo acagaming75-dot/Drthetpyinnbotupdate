@@ -15,7 +15,7 @@ import re
 from html import unescape
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlparse
 import httpx
 
 from telegram import (
@@ -57,13 +57,26 @@ SIGNAL_HIST_FILE = DATA_DIR / "signal_history.json"
 SOURCE_HIST_FILE = DATA_DIR / "source_history.json"
 USER_ROUNDS_FILE = DATA_DIR / "user_rounds.json"
 
-# The official game result endpoint is not exposed by the public web page in
-# every deployment.  When GAME_HISTORY_URL is supplied, the bot uses it for
-# automatic WIN/LOSS settlement.  The URL may contain {txn}; otherwise the
-# transaction number is also sent as the `txn` query parameter.
+# Public website readers.  Keep URLs in Railway Variables; never put login
+# credentials, cookies, or private API keys in this file.  The reader only uses
+# public HTTP responses and stops on Cloudflare/CAPTCHA/authentication pages.
+def _env_urls(*names: str) -> list[str]:
+    for name in names:
+        raw = os.getenv(name, "").strip()
+        if raw:
+            return [item.strip() for item in re.split(r"[\n,]+", raw) if item.strip()]
+    return []
+
+LOTTERY_PROVIDER = os.getenv("LOTTERY_PROVIDER", "auto").strip().lower()
+SIX_LOTTERY_URLS = _env_urls("SIX_LOTTERY_URL", "SIXLOTTERY_URL", "6LOTTERY_URL")
+CK_LOTTERY_URLS = _env_urls("CKLOTTERY_URL", "CK_LOTTERY_URL")
+GENERIC_LOTTERY_URLS = _env_urls("LOTTERY_URLS", "LOTTERY_SITE_URLS")
 GAME_HISTORY_URL = os.getenv("GAME_HISTORY_URL", "").strip()
-ROUND_SECONDS = 60
-RESULT_GRACE_SECONDS = 8
+LOTTERY_RESULT_URLS = _env_urls("LOTTERY_RESULT_URL", "LOTTERY_RESULT_URLS")
+WEBSITE_TIMEOUT_SECONDS = max(4, int(os.getenv("WEBSITE_TIMEOUT_SECONDS", "12")))
+RESULT_GRACE_SECONDS = max(0, int(os.getenv("RESULT_GRACE_SECONDS", "8")))
+RESULT_POLL_SECONDS = max(2, int(os.getenv("RESULT_POLL_SECONDS", "6")))
+RESULT_POLL_ATTEMPTS = max(1, int(os.getenv("RESULT_POLL_ATTEMPTS", "20")))
 COUNTDOWN_UPDATE_SECONDS = 1
 
 # The four bot images are embedded in this file so no images folder is needed.
@@ -354,15 +367,19 @@ def save_user_round(
     badge: str,
     confidence: int,
     issued_at: datetime,
+    actual_round_id: str,
+    provider: str,
     round_end: datetime,
 ) -> str:
-    """Persist a prediction before sending it so results survive restarts."""
-    round_id = issued_at.strftime("%Y%m%d%H%M%S%f")
+    """Persist a prediction with the website's real round identity and end time."""
+    prediction_id = issued_at.strftime("%Y%m%d%H%M%S%f")
     data = load_user_rounds()
     rounds = data.setdefault(str(user_id), [])
     rounds.append({
-        "id": round_id,
+        "id": prediction_id,
         "transaction": txn_no,
+        "round_id": actual_round_id,
+        "provider": provider,
         "signal": signal,
         "badge": badge,
         "confidence": confidence,
@@ -378,7 +395,7 @@ def save_user_round(
     })
     data[str(user_id)] = rounds[-100:]
     save_user_rounds(data)
-    return round_id
+    return prediction_id
 
 
 def update_user_round(user_id: int, round_id: str, **changes) -> dict | None:
@@ -400,11 +417,12 @@ def get_user_round(user_id: int, round_id: str) -> dict | None:
 
 
 def open_rounds(user_id: int) -> list:
-    now = datetime.now(timezone.utc)
+    # A round remains locked until the official website result is known.  It
+    # must not become available merely because a local timer reached zero.
     return [
         item for item in _user_rounds(user_id)
         if item.get("status") == "OPEN"
-        and _parse_utc(item.get("round_end")) > now
+        and item.get("result") not in {"WIN", "LOSS"}
     ]
 
 
@@ -447,7 +465,7 @@ def result_from_value(value) -> tuple[str | None, str | None]:
 
 
 def _walk_result_records(value):
-    """Yield dictionaries from nested JSON returned by different game sites."""
+    """Yield dictionaries from nested JSON returned by public game sites."""
     if isinstance(value, dict):
         yield value
         for child in value.values():
@@ -457,19 +475,310 @@ def _walk_result_records(value):
             yield from _walk_result_records(child)
 
 
-def _result_for_transaction(payload, txn_no: str) -> tuple[str | None, str | None]:
-    txn = str(txn_no).strip()
+def _is_blocked_page(status_code: int, text: str) -> bool:
+    if status_code in {401, 403, 429}:
+        return True
+    return bool(re.search(
+        r"cloudflare|captcha|verify you are human|access denied|challenge-platform",
+        text[:30000],
+        flags=re.IGNORECASE,
+    ))
+
+
+def _site_urls() -> list[tuple[str, str]]:
+    entries: list[tuple[str, str]] = []
+    if LOTTERY_PROVIDER in {"auto", "6lottery", "sixlottery", "6"}:
+        entries.extend(("6lottery", url) for url in SIX_LOTTERY_URLS)
+    if LOTTERY_PROVIDER in {"auto", "cklottery", "ck", "ck-lottery"}:
+        entries.extend(("cklottery", url) for url in CK_LOTTERY_URLS)
+    if LOTTERY_PROVIDER in {"auto", "generic"}:
+        for url in GENERIC_LOTTERY_URLS:
+            lower = url.lower()
+            provider = "cklottery" if "cklottery" in lower else "6lottery" if "6lottery" in lower else "lottery"
+            entries.append((provider, url))
+    seen: set[str] = set()
+    result: list[tuple[str, str]] = []
+    for provider, raw_url in entries:
+        url = raw_url.strip()
+        if not re.match(r"^https?://", url, re.IGNORECASE):
+            continue
+        parsed = urlparse(url)
+        if not parsed.netloc or parsed.username or parsed.password:
+            continue
+        if url not in seen:
+            seen.add(url)
+            result.append((provider, url))
+    return result
+
+
+def _parse_site_datetime(value) -> datetime | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)) or (isinstance(value, str) and re.fullmatch(r"\d{10,16}", value.strip())):
+        try:
+            number = float(value)
+            if number > 10_000_000_000:
+                number /= 1000
+            return datetime.fromtimestamp(number, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    raw = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        parsed = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                parsed = datetime.strptime(raw, fmt)
+                break
+            except ValueError:
+                continue
+    if parsed is None:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _parse_seconds(value) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    else:
+        raw = str(value).strip()
+        match = re.fullmatch(r"(\d{1,3}):(\d{1,2})(?::(\d{1,2}))?", raw)
+        if match:
+            parts = [int(x) for x in match.groups() if x is not None]
+            return parts[0] * (3600 if len(parts) == 3 else 60) + parts[-2] * 60 + parts[-1] if len(parts) == 3 else parts[0] * 60 + parts[1]
+        match = re.search(r"(-?\d+(?:\.\d+)?)", raw)
+        if not match:
+            return None
+        number = float(match.group(1))
+    if number > 10_000:
+        number /= 1000
+    seconds = int(number)
+    return seconds if 0 <= seconds <= 24 * 60 * 60 else None
+
+
+def _first_value(item: dict, keys: tuple[str, ...]):
+    lowered = {str(key).lower(): value for key, value in item.items()}
+    for key in keys:
+        if key.lower() in lowered:
+            return lowered[key.lower()]
+    return None
+
+
+def _record_round_id(item: dict) -> str | None:
+    value = _first_value(item, (
+        "roundId", "round_id", "roundNo", "round", "period", "periodNo",
+        "issue", "issueNumber", "issueNo", "gameId", "gameNo", "drawId",
+        "transaction", "transactionNo", "transaction_no",
+    ))
+    if value is None or isinstance(value, (dict, list)):
+        return None
+    value = str(value).strip()
+    return value if value and value.lower() not in {"null", "none", "undefined"} else None
+
+
+def _record_end_time(item: dict) -> datetime | None:
+    return _parse_site_datetime(_first_value(item, (
+        "endTime", "end_time", "closingTime", "closeTime", "expireAt",
+        "expiresAt", "deadline", "roundEnd", "round_end", "nextDrawTime",
+    )))
+
+
+def _record_remaining(item: dict) -> int | None:
+    return _parse_seconds(_first_value(item, (
+        "countdown", "countDown", "countdownSeconds", "remaining", "remain",
+        "remainTime", "remainingTime", "leftTime", "leftSeconds",
+        "secondsRemaining", "timeLeft", "timeRemaining",
+    )))
+
+
+def _record_server_time(item: dict) -> datetime | None:
+    return _parse_site_datetime(_first_value(item, (
+        "serverTime", "server_time", "currentTime", "current_time", "now",
+        "timestamp", "time",
+    )))
+
+
+def _snapshot_from_payload(payload, provider: str, source_url: str, observed_at: datetime) -> dict | None:
+    for item in _walk_result_records(payload):
+        round_id = _record_round_id(item)
+        if not round_id:
+            continue
+        end_at = _record_end_time(item)
+        remaining = _record_remaining(item)
+        server_time = _record_server_time(item) or observed_at
+        if end_at is None and remaining is not None:
+            end_at = server_time + timedelta(seconds=remaining)
+        if end_at is None or end_at <= observed_at - timedelta(minutes=5):
+            continue
+        return {
+            "provider": provider,
+            "source_url": source_url,
+            "round_id": round_id,
+            "round_end": end_at.astimezone(timezone.utc),
+            "server_time": server_time.astimezone(timezone.utc),
+            "remaining": max(0, int((end_at - observed_at).total_seconds() + 0.999)),
+        }
+    return None
+
+
+def _extract_html_fields(text: str) -> dict:
+    # Conservative fallback for sites that render public values directly in HTML.
+    def find(pattern: str):
+        match = re.search(pattern, text, flags=re.IGNORECASE | re.DOTALL)
+        return match.group(1).strip() if match else None
+    return {
+        "roundId": find(r"(?:roundId|round_id|roundNo|period|issue(?:Number|No)?|gameId)\s*[=:]\s*[\"']?([A-Za-z0-9_-]{4,})"),
+        "countdown": find(r"(?:countdown|remaining|remainTime|leftTime|secondsRemaining|timeLeft)\s*[=:]\s*[\"']?([0-9]{1,3}(?::[0-9]{1,2})?)"),
+        "endTime": find(r"(?:endTime|end_time|closingTime|expireAt|deadline|roundEnd)\s*[=:]\s*[\"']?([^\"',}<>]+)"),
+        "serverTime": find(r"(?:serverTime|server_time|currentTime|timestamp)\s*[=:]\s*[\"']?([^\"',}<>]+)"),
+    }
+
+
+def _json_payloads_from_text(text: str) -> list:
+    payloads: list = []
+    try:
+        payloads.append(json.loads(text))
+    except (TypeError, ValueError):
+        pass
+    scripts = re.findall(r"<script[^>]*>(.*?)</script>", text, flags=re.IGNORECASE | re.DOTALL)
+    for script in scripts:
+        candidate = script.strip()
+        if not candidate:
+            continue
+        if candidate.startswith("{") or candidate.startswith("["):
+            try:
+                payloads.append(json.loads(candidate))
+            except (TypeError, ValueError):
+                pass
+        for marker in ("__INITIAL_STATE__", "__NEXT_DATA__", "initialState", "gameData"):
+            start = candidate.find(marker)
+            if start < 0:
+                continue
+            brace = min([x for x in (candidate.find("{", start), candidate.find("[", start)) if x >= 0] or [-1])
+            if brace < 0:
+                continue
+            opening = candidate[brace]
+            closing = "}" if opening == "{" else "]"
+            depth = 0
+            in_string = False
+            escaped = False
+            for index in range(brace, len(candidate)):
+                char = candidate[index]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == '"':
+                        in_string = False
+                    continue
+                if char == '"':
+                    in_string = True
+                elif char == opening:
+                    depth += 1
+                elif char == closing:
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            payloads.append(json.loads(candidate[brace:index + 1]))
+                        except (TypeError, ValueError):
+                            pass
+                        break
+    return payloads
+
+
+def _discovered_public_urls(base_url: str, text: str) -> list[str]:
+    origin = f"{urlparse(base_url).scheme}://{urlparse(base_url).netloc}"
+    candidates = re.findall(r"<script[^>]+src=[\"']([^\"']+)", text, flags=re.IGNORECASE)
+    candidates += re.findall(r"[\"']((?:https?://|/)(?:[^\"']*(?:api|lottery|game|result|history|period|issue)[^\"']*))[\"']", text, flags=re.IGNORECASE)
+    result: list[str] = []
+    for candidate in candidates:
+        url = urljoin(base_url, candidate)
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or parsed.netloc != urlparse(base_url).netloc:
+            continue
+        if url not in result:
+            result.append(url)
+    return result[:8]
+
+
+async def _public_payloads(client, url: str, params: dict | None = None) -> tuple[list[object], str, list[str]]:
+    response = await client.get(url, params=params)
+    body = response.text
+    if _is_blocked_page(response.status_code, body):
+        logger.warning("Public website blocked or challenged: %s", response.url)
+        return [], body, []
+    response.raise_for_status()
+    payloads = _json_payloads_from_text(body)
+    if not payloads:
+        payloads.append(_extract_html_fields(body))
+    return payloads, body, _discovered_public_urls(str(response.url), body)
+
+
+async def fetch_website_snapshot(transaction: str | None = None) -> dict | None:
+    """Read a real public round ID and timer; never invent a 60-second deadline."""
+    del transaction
+    sites = _site_urls()
+    if not sites:
+        if GAME_HISTORY_URL:
+            logger.warning("No public lottery page URL configured; result endpoint alone cannot issue a timed signal")
+        else:
+            logger.warning("No 6lottery/CKLottery public URL configured")
+        return None
+    observed_at = datetime.now(timezone.utc)
+    try:
+        async with httpx.AsyncClient(
+            timeout=WEBSITE_TIMEOUT_SECONDS,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 DrThetPyinnSignalBot public-reader"},
+        ) as client:
+            for provider, url in sites:
+                try:
+                    payloads, body, discovered = await _public_payloads(client, url)
+                    for payload in payloads:
+                        snapshot = _snapshot_from_payload(payload, provider, url, observed_at)
+                        if snapshot:
+                            logger.info("Website round read: %s %s", provider, snapshot["round_id"])
+                            return snapshot
+                    for discovered_url in discovered:
+                        try:
+                            extra_payloads, _, _ = await _public_payloads(client, discovered_url)
+                        except (httpx.HTTPError, OSError):
+                            continue
+                        for payload in extra_payloads:
+                            snapshot = _snapshot_from_payload(payload, provider, discovered_url, observed_at)
+                            if snapshot:
+                                logger.info("Website API round read: %s %s", provider, snapshot["round_id"])
+                                return snapshot
+                except (httpx.HTTPError, OSError) as error:
+                    logger.warning("Could not read public %s page: %s", provider, error)
+    except (httpx.HTTPError, OSError) as error:
+        logger.warning("Public website reader failed: %s", error)
+    return None
+
+
+def _result_for_transaction(payload, txn_no: str, round_id: str | None = None) -> tuple[str | None, str | None]:
+    identifiers_needed = {str(txn_no).strip()}
+    if round_id:
+        identifiers_needed.add(str(round_id).strip())
+    identifiers_needed = {item for item in identifiers_needed if item}
     for item in _walk_result_records(payload):
         identifiers = " ".join(
             str(item.get(key, "")) for key in (
-                "transaction", "transactionNo", "transaction_no",
-                "period", "issue", "issueNumber", "round", "roundNo",
-                "id", "gameId",
+                "transaction", "transactionNo", "transaction_no", "period", "periodNo",
+                "issue", "issueNumber", "issueNo", "round", "roundNo", "roundId",
+                "round_id", "id", "gameId", "gameNo", "drawId",
             )
         )
-        if txn not in identifiers:
+        if not any(token == identifiers.strip() or token in identifiers.split() or token in identifiers for token in identifiers_needed):
             continue
-        for key in ("result", "number", "num", "openNumber", "winningNumber", "value", "code"):
+        for key in ("result", "number", "num", "openNumber", "winningNumber", "winningNo", "value", "code"):
             if key in item:
                 direction, actual = result_from_value(item[key])
                 if direction:
@@ -480,33 +789,60 @@ def _result_for_transaction(payload, txn_no: str) -> tuple[str | None, str | Non
     return None, None
 
 
-async def fetch_game_result(txn_no: str) -> tuple[str | None, str | None]:
-    """Best-effort result lookup; unavailable endpoints never create a result."""
-    if not GAME_HISTORY_URL:
+async def fetch_game_result(
+    txn_no: str,
+    round_id: str | None = None,
+    provider: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Read only a matching official website result; unavailable means pending."""
+    sites = [(provider or name, url) for name, url in _site_urls() if not provider or name == provider]
+    explicit_urls = []
+    if GAME_HISTORY_URL:
+        explicit_urls.append(GAME_HISTORY_URL)
+    explicit_urls.extend(LOTTERY_RESULT_URLS)
+    for url in explicit_urls:
+        if url not in [item[1] for item in sites]:
+            sites.append((provider or "lottery", url))
+    if not sites:
         return None, None
-    url = GAME_HISTORY_URL.replace("{txn}", quote(str(txn_no), safe=""))
-    params = {} if "{txn}" in GAME_HISTORY_URL else {
+    query = {
         "txn": txn_no,
         "transactionNo": txn_no,
         "period": txn_no,
         "issue": txn_no,
+        "round": round_id or txn_no,
+        "roundId": round_id or txn_no,
     }
     try:
         async with httpx.AsyncClient(
-            timeout=CHANNEL_FETCH_TIMEOUT_SECONDS,
+            timeout=WEBSITE_TIMEOUT_SECONDS,
             follow_redirects=True,
-            headers={"User-Agent": "DrThetPyinnSignalBot/2.0"},
+            headers={"User-Agent": "Mozilla/5.0 DrThetPyinnSignalBot public-reader"},
         ) as client:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            try:
-                payload = response.json()
-            except ValueError:
-                payload = response.text
-        return _result_for_transaction(payload, txn_no)
+            for _, raw_url in sites:
+                url = raw_url.replace("{txn}", quote(str(txn_no), safe=""))
+                params = {} if "{txn}" in raw_url else query
+                try:
+                    payloads, body, discovered = await _public_payloads(client, url, params=params)
+                except (httpx.HTTPError, OSError) as error:
+                    logger.warning("Could not read result page %s: %s", raw_url, error)
+                    continue
+                for payload in payloads:
+                    direction, actual = _result_for_transaction(payload, txn_no, round_id)
+                    if direction:
+                        return direction, actual
+                for discovered_url in discovered:
+                    try:
+                        extra_payloads, _, _ = await _public_payloads(client, discovered_url, params=params)
+                    except (httpx.HTTPError, OSError):
+                        continue
+                    for payload in extra_payloads:
+                        direction, actual = _result_for_transaction(payload, txn_no, round_id)
+                        if direction:
+                            return direction, actual
     except (httpx.HTTPError, OSError) as error:
-        logger.warning("Could not read game result for %s: %s", txn_no, error)
-        return None, None
+        logger.warning("Could not read official result: %s", error)
+    return None, None
 
 
 def signal_quality(signal: str) -> tuple[str, int]:
@@ -535,6 +871,15 @@ def format_countdown(seconds: int) -> str:
 def stats_text(user_id: int) -> str:
     wins, losses, total, rate = user_stats(user_id)
     open_count = len(open_rounds(user_id))
+    recent = _user_rounds(user_id)[-5:]
+    lines = []
+    for item in reversed(recent):
+        outcome = item.get("result") or "RESULT PENDING"
+        actual = item.get("actual") or "—"
+        lines.append(
+            f"• `{item.get('round_id', '—')}` | {item.get('signal', '—')} → {actual} | {outcome}"
+        )
+    recent_text = "\n".join(lines) if lines else "မှတ်တမ်း မရှိသေးပါ"
     return (
         "📈 *My Signal Record*\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
@@ -543,7 +888,9 @@ def stats_text(user_id: int) -> str:
         f"🎮 Completed : {total}\n"
         f"🏆 Win rate  : {rate:.1f}%\n"
         f"⏳ Active    : {open_count}\n\n"
-        "Win rate သည် သင်မှတ်တမ်းတင်ထားသော result များကိုသာ အခြေခံထားပါသည်။"
+        "*Recent rounds*\n"
+        f"{recent_text}\n\n"
+        "Win rate သည် official website result ရရှိပြီး WIN/LOSS သတ်မှတ်ထားသော round များကိုသာ အခြေခံထားပါသည်။"
     )
 
 
@@ -571,35 +918,8 @@ def parse_result_from_text(text: str) -> tuple[str | None, str | None]:
 
 
 async def settle_channel_result(bot, transaction: str, direction: str, actual: str | None):
-    """Settle every user's open prediction for an explicitly labelled result post."""
-    for user_id, rounds in load_user_rounds().items():
-        for item in rounds if isinstance(rounds, list) else []:
-            if (
-                item.get("status") == "OPEN"
-                and str(item.get("transaction", "")).strip() == str(transaction).strip()
-            ):
-                result = "WIN" if item.get("signal") == direction else "LOSS"
-                updated = update_user_round(
-                    int(user_id),
-                    item.get("id", ""),
-                    status=result,
-                    result=result,
-                    actual=actual or direction,
-                    settled_at=datetime.now(timezone.utc).isoformat(),
-                    settled_by="telegram_source",
-                )
-                settle_signal_history(item.get("id", ""), result, actual or direction)
-                if updated and updated.get("message_id"):
-                    try:
-                        await bot.edit_message_caption(
-                            chat_id=updated.get("chat_id", int(user_id)),
-                            message_id=updated["message_id"],
-                            caption=build_round_caption(updated),
-                            parse_mode=ParseMode.MARKDOWN,
-                            reply_markup=kb_signal_actions(),
-                        )
-                    except Exception as error:
-                        logger.warning("Could not show channel-settled result: %s", error)
+    # Compatibility shim: Telegram source posts are not authoritative for results.
+    logger.info("Ignoring Telegram source result for %s (%s); website result is required", transaction, direction)
 
 
 def build_round_caption(item: dict, remaining: int | None = None) -> str:
@@ -620,6 +940,8 @@ def build_round_caption(item: dict, remaining: int | None = None) -> str:
         "🎯 *Signal Result*\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"🎮 Transaction no. : `{item.get('transaction', '—')}`\n"
+        f"🆔 Website Round ID : `{item.get('round_id', '—')}`\n"
+        f"🌐 Source           : {item.get('provider', '—')}\n"
         "⏱ Timeframe        : 1 Minute\n"
         f"🕐 Time             : {item.get('issued_at', '')[:19].replace('T', ' ')} UTC\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
@@ -641,40 +963,50 @@ async def settle_round_now(
     item = get_user_round(user_id, round_id)
     if not item or item.get("result") in {"WIN", "LOSS"}:
         return item
-    direction, actual = await fetch_game_result(item.get("transaction", ""))
+    end_at = _parse_utc(item.get("round_end"))
+    if datetime.now(timezone.utc) < end_at:
+        return item
+    direction, actual = await fetch_game_result(
+        item.get("transaction", ""),
+        round_id=item.get("round_id"),
+        provider=item.get("provider"),
+    )
     if not direction:
+        updated = update_user_round(
+            user_id, round_id, status="OPEN", result=None, actual=None,
+            pending_at=datetime.now(timezone.utc).isoformat(),
+        ) or item
+        try:
+            await bot.edit_message_caption(
+                chat_id=chat_id, message_id=updated.get("message_id"),
+                caption=build_round_caption(updated), parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb_user_signal_actions(user_id, round_id, locked=True),
+            )
+        except Exception as error:
+            logger.warning("Could not show pending result: %s", error)
         if announce_pending:
             await _send_text_retry(
-                bot,
-                chat_id,
-                "📡 ဒီ round ရဲ့ official result ကို မရသေးပါ။\n"
-                "Result ရလာတဲ့အခါ ပြန်စစ်နိုင်ပါတယ်။",
+                bot, chat_id,
+                "📡 ဒီ round ရဲ့ official website result မရသေးပါ။\n"
+                "Fake WIN/LOSS မပြဘဲ RESULT PENDING အဖြစ်ထားထားပါတယ်။",
             )
-        return item
+        return updated
     result = "WIN" if direction == item.get("signal") else "LOSS"
     updated = update_user_round(
-        user_id,
-        round_id,
-        status=result,
-        result=result,
-        actual=actual or direction,
+        user_id, round_id, status=result, result=result, actual=actual or direction,
         settled_at=datetime.now(timezone.utc).isoformat(),
-        settled_by="game_history",
+        settled_by="public_website",
     )
     settle_signal_history(round_id, result, actual or direction)
-    if updated:
-        message_id = updated.get("message_id")
-        if message_id:
-            try:
-                await bot.edit_message_caption(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    caption=build_round_caption(updated),
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=kb_signal_actions(round_id),
-                )
-            except Exception as error:
-                logger.warning("Could not update settled signal message: %s", error)
+    if updated and updated.get("message_id"):
+        try:
+            await bot.edit_message_caption(
+                chat_id=chat_id, message_id=updated["message_id"],
+                caption=build_round_caption(updated), parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb_user_signal_actions(user_id, round_id, locked=False),
+            )
+        except Exception as error:
+            logger.warning("Could not update settled signal message: %s", error)
     return updated
 
 
@@ -700,7 +1032,7 @@ async def track_round(bot, user_id: int, round_id: str, chat_id: int):
                 message_id=message_id,
                 caption=build_round_caption(item, remaining),
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb_signal_actions(round_id),
+                reply_markup=kb_user_signal_actions(user_id, round_id, locked=True),
             )
         except RetryAfter as error:
             await asyncio.sleep(min(max(1, int(error.retry_after)), 10))
@@ -860,24 +1192,26 @@ def kb_vip_required():
 def kb_time_select():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏱ 1m", callback_data="time_1m")]])
 
-def kb_signal_actions(round_id: str | None = None):
+def kb_signal_actions(round_id: str | None = None, locked: bool = False):
     check_button = (
         [InlineKeyboardButton("🔍 Check Result", callback_data=f"check_result:{round_id}")]
         if round_id
         else []
     )
+    next_label = "⏳ Next Round (locked)" if locked else "➡️ Next Round"
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔄 Change ID",  callback_data="change_id"),
-        InlineKeyboardButton("➡️ Next Round", callback_data="next_round"),
+        InlineKeyboardButton("🔄 Change ID", callback_data="change_id"),
+        InlineKeyboardButton(next_label, callback_data="next_round"),
     ], [
         InlineKeyboardButton("📈 My Record", callback_data="my_stats"),
     ]] + ([check_button] if check_button else []))
 
-def kb_free_signal_actions(round_id: str | None = None):
+def kb_free_signal_actions(round_id: str | None = None, locked: bool = False):
+    next_label = "⏳ Next Round (locked)" if locked else "➡️ Next Round"
     buttons = [
         [
             InlineKeyboardButton("🔄 Change ID", callback_data="change_id"),
-            InlineKeyboardButton("➡️ Next Round", callback_data="next_round"),
+            InlineKeyboardButton(next_label, callback_data="next_round"),
         ],
         [InlineKeyboardButton("📈 My Record", callback_data="my_stats")],
         [InlineKeyboardButton("⏸ Stop Free Timer", callback_data="stop_free")],
@@ -887,6 +1221,13 @@ def kb_free_signal_actions(round_id: str | None = None):
             InlineKeyboardButton("🔍 Check Result", callback_data=f"check_result:{round_id}")
         ])
     return InlineKeyboardMarkup(buttons)
+
+def kb_user_signal_actions(user_id: int, round_id: str | None, locked: bool = False):
+    return (
+        kb_free_signal_actions(round_id, locked=locked)
+        if not is_vip(user_id)
+        else kb_signal_actions(round_id, locked=locked)
+    )
 
 def kb_admin():
     return InlineKeyboardMarkup([
@@ -1047,14 +1388,16 @@ async def handle_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not post:
         return
     post_text = (post.text or post.caption or "").strip()
-    result_direction, actual = parse_result_from_text(post_text)
-    transaction = parse_transaction_from_text(post_text)
-    if result_direction and transaction:
-        await settle_channel_result(ctx.bot, transaction, result_direction, actual)
-    else:
-        sig = parse_signal_from_text(post_text)
-        if sig:
-            save_channel_signal(sig)
+    # Telegram source posts are authoritative only for the source signal.  Any
+    # result-looking post is intentionally ignored; WIN/LOSS comes from the
+    # configured 6lottery/CKLottery public website reader.
+    result_direction, _ = parse_result_from_text(post_text)
+    if result_direction:
+        logger.info("Ignoring source-channel result post; website result required")
+        return
+    sig = parse_signal_from_text(post_text)
+    if sig:
+        save_channel_signal(sig)
 
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1166,8 +1509,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer("❌ Access မရှိတော့ပါ။ Admin ထံဆက်သွယ်ပါ။", show_alert=True); return
         if open_rounds(user.id):
             await q.answer(
-                "⚠️ ပထမကစားပွဲ မပြီးသေးပါ။\n"
-                "1 Minute ပြည့်ပြီး WIN/LOSS ပြပြီးမှ Next Round ပြောင်းပါ။",
+                "ပထမကစားပွဲ မပြီးသေးပါ။ WIN/LOSS ပြပြီးမှ Next Round ပြောင်းနိုင်ပါမည်။",
                 show_alert=True,
             )
             return
@@ -1269,7 +1611,24 @@ async def _send_signal(q, ctx: ContextTypes.DEFAULT_TYPE):
     if is_free and not start_free_timer(user_id):
         await q.answer("🎁 ဒီနေ့ Free time ကုန်သွားပါပြီ။", show_alert=True)
         return
-    signal     = await generate_signal(txn_no)
+    # Read the website round first.  This is only for the real round identity and
+    # countdown; the signal itself still comes exclusively from the source channel.
+    snapshot = await fetch_website_snapshot(txn_no)
+    if not snapshot:
+        if is_free:
+            pause_free_timer(user_id)
+        await q.answer(
+            "📡 Website ရဲ့ actual round/countdown မရသေးပါ။ Fake signal မထုတ်ပါ။",
+            show_alert=True,
+        )
+        await _send_text_retry(
+            ctx.bot,
+            q.message.chat_id,
+            "⚠️ 6lottery/CKLottery public website data ကို မဖတ်နိုင်သေးပါ။\n"
+            "Login/CAPTCHA ကို bypass မလုပ်ဘဲ actual round data ရလာမှ ပြန်တောင်းပေးပါ။",
+        )
+        return
+    signal = await generate_signal(txn_no)
     if not signal:
         if is_free:
             pause_free_timer(user_id)
@@ -1285,7 +1644,12 @@ async def _send_signal(q, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
     issued_at = datetime.now(timezone.utc)
-    round_end = issued_at + timedelta(seconds=ROUND_SECONDS)
+    round_end = _parse_utc(snapshot.get("round_end"))
+    if round_end <= issued_at:
+        if is_free:
+            pause_free_timer(user_id)
+        await q.answer("📡 Website round ပြောင်းနေပါသည်။ ခဏစောင့်ပြီး ပြန်စမ်းပါ။", show_alert=True)
+        return
     badge, confidence = signal_quality(signal)
     round_id = save_user_round(
         user_id,
@@ -1294,12 +1658,15 @@ async def _send_signal(q, ctx: ContextTypes.DEFAULT_TYPE):
         badge,
         confidence,
         issued_at,
+        str(snapshot["round_id"]),
+        str(snapshot["provider"]),
         round_end,
     )
     save_signal_to_history(signal, txn_no=txn_no, prediction_id=round_id)
     item = get_user_round(user_id, round_id) or {}
     img_name   = "big" if signal == "BIG" else "small"
-    caption = build_round_caption(item, ROUND_SECONDS)
+    remaining = max(0, int((round_end - datetime.now(timezone.utc)).total_seconds() + 0.999))
+    caption = build_round_caption(item, remaining)
     try: await q.message.delete()
     except Exception: pass
     try:
@@ -1310,9 +1677,9 @@ async def _send_signal(q, ctx: ContextTypes.DEFAULT_TYPE):
             caption=caption,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=(
-                kb_free_signal_actions(round_id)
+                kb_free_signal_actions(round_id, locked=True)
                 if is_free
-                else kb_signal_actions(round_id)
+                else kb_signal_actions(round_id, locked=True)
             ),
         )
         update_user_round(
