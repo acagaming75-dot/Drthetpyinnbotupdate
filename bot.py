@@ -89,6 +89,8 @@ CHANNEL_SIG_MAX_AGE_MIN = 15
 ANTI_STREAK_COUNT       = 3
 FREE_DAILY_SECONDS      = 60 * 60
 CHANNEL_FETCH_TIMEOUT_SECONDS = 12
+CHANNEL_FETCH_RETRIES = 3
+CHANNEL_FETCH_BACKOFF_SECONDS = 1
 CHANNEL_CACHE_MAX_AGE_MIN = 3
 
 logging.basicConfig(
@@ -826,14 +828,27 @@ def parse_signal_from_text(text: str) -> str | None:
 
 def _parse_public_channel_posts(page: str) -> list[tuple[datetime, str]]:
     """Extract signal text and its public post time from t.me/s HTML."""
-    texts = re.findall(
-        r'<div class="tgme_widget_message_text js-message_text"[^>]*>(.*?)</div>',
-        page,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    times = re.findall(r'<time datetime="([^"]+)"', page, flags=re.IGNORECASE)
     posts: list[tuple[datetime, str]] = []
-    for raw_text, raw_time in zip(texts, times):
+    message_parts = re.split(
+        r'(?=<div[^>]+class="[^"]*\btgme_widget_message_wrap\b[^"]*"[^>]*>)',
+        page,
+        flags=re.IGNORECASE,
+    )
+    for message in message_parts:
+        text_match = re.search(
+            r'<div[^>]+class="[^"]*\btgme_widget_message_text\b[^"]*"[^>]*>(.*?)</div>',
+            message,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        time_match = re.search(
+            r'<time[^>]+datetime="([^"]+)"',
+            message,
+            flags=re.IGNORECASE,
+        )
+        if not text_match or not time_match:
+            continue
+        raw_text = text_match.group(1)
+        raw_time = time_match.group(1)
         signal = parse_signal_from_text(raw_text)
         if not signal:
             continue
@@ -848,36 +863,58 @@ def _parse_public_channel_posts(page: str) -> list[tuple[datetime, str]]:
 
 async def fetch_latest_public_channel_signal() -> str | None:
     """Read the latest signal from the public channel preview; no admin rights required."""
-    try:
-        async with httpx.AsyncClient(
-            timeout=CHANNEL_FETCH_TIMEOUT_SECONDS,
-            follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 signal-bot-public-reader"},
-        ) as client:
-            response = await client.get(SIGNAL_CHANNEL_URL)
-            response.raise_for_status()
-        posts = _parse_public_channel_posts(response.text)
-        if not posts:
-            logger.warning("No BIG/SMALL signal found in public channel preview")
-            return None
-        post_time, source_signal = max(posts, key=lambda item: item[0])
-        age_minutes = (datetime.now(timezone.utc) - post_time).total_seconds() / 60
-        if age_minutes > CHANNEL_SIG_MAX_AGE_MIN:
-            logger.warning(
-                "Latest public channel signal is stale: %.1f minutes old",
-                age_minutes,
+    request_error = None
+    for attempt in range(1, CHANNEL_FETCH_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(
+                    CHANNEL_FETCH_TIMEOUT_SECONDS,
+                    connect=min(8, CHANNEL_FETCH_TIMEOUT_SECONDS),
+                ),
+                follow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0 signal-bot-public-reader"},
+            ) as client:
+                response = await client.get(SIGNAL_CHANNEL_URL)
+                response.raise_for_status()
+            posts = _parse_public_channel_posts(response.text)
+            if not posts:
+                raise ValueError("No BIG/SMALL signal found in public channel preview")
+            post_time, source_signal = max(posts, key=lambda item: item[0])
+            age_minutes = (datetime.now(timezone.utc) - post_time).total_seconds() / 60
+            if age_minutes > CHANNEL_SIG_MAX_AGE_MIN:
+                logger.warning(
+                    "Latest public channel signal is stale: %.1f minutes old",
+                    age_minutes,
+                )
+                return get_channel_signal()
+            save_channel_signal(source_signal, source_timestamp=post_time.isoformat())
+            logger.info(
+                "Public channel signal read: %s at %s",
+                source_signal,
+                post_time.isoformat(),
             )
-            return None
-        save_channel_signal(source_signal, source_timestamp=post_time.isoformat())
-        logger.info(
-            "Public channel signal read: %s at %s",
-            source_signal,
-            post_time.isoformat(),
-        )
-        return source_signal
-    except (httpx.HTTPError, OSError) as error:
-        logger.warning("Could not read public channel preview: %s", error)
-        return get_channel_signal()
+            return source_signal
+        except (httpx.HTTPError, OSError, ValueError) as error:
+            request_error = error
+            if attempt < CHANNEL_FETCH_RETRIES:
+                wait_seconds = CHANNEL_FETCH_BACKOFF_SECONDS * attempt
+                logger.warning(
+                    "Could not read public channel preview (attempt %d/%d): %s; retrying in %ds",
+                    attempt,
+                    CHANNEL_FETCH_RETRIES,
+                    error,
+                    wait_seconds,
+                )
+                await asyncio.sleep(wait_seconds)
+            else:
+                logger.warning("Could not read public channel preview: %s", error)
+
+    cached = get_channel_signal()
+    if cached:
+        logger.info("Using cached public channel signal after fetch failure: %s", cached)
+    elif request_error:
+        logger.warning("No usable cached channel signal is available")
+    return cached
 
 # ── Signal history / anti-streak ───────────────────────────────────────────────
 
