@@ -1441,27 +1441,9 @@ async def _send_signal(q, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("🎁 ဒီနေ့ Free time ကုန်သွားပါပြီ။", show_alert=True)
         return
 
-    website_state = await fetch_website_state()
-    if not website_state:
-        if is_free:
-            pause_free_timer(user_id)
-        await q.answer("📡 Website live round မရသေးပါ။ ခဏစောင့်ပြီး ပြန်စမ်းပါ။", show_alert=True)
-        return
-
-    website_round_id = website_state["current_issue"]
-    website_end_ms = website_state["current_end_ms"]
-    website_fetched_at_ms = website_state["fetched_at_ms"]
-    website_remaining = website_remaining_seconds(
-        {"website_round_id": website_round_id},
-        website_state,
-    )
-    if website_remaining <= 0:
-        if is_free:
-            pause_free_timer(user_id)
-        await q.answer("📡 Website ရဲ့ Next Round ကို မရသေးပါ။ ခဏစောင့်ပြီး ပြန်စမ်းပါ။", show_alert=True)
-        return
-
     # Signal direction still comes exclusively from the Telegram source channel.
+    # Do not block the signal on the website clock: the website is only used
+    # later for countdown and result settlement.
     signal     = await generate_signal(txn_no)
     if not signal:
         if is_free:
@@ -1478,31 +1460,19 @@ async def _send_signal(q, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Re-read the website after the channel fetch so the saved round is still
-    # the currently open website round, even if the source request took time.
-    latest_website_state = await fetch_website_state()
-    if (
-        not latest_website_state
-        or latest_website_state["current_issue"] != website_round_id
-        or website_remaining_seconds(
-            {"website_round_id": latest_website_state["current_issue"]},
-            latest_website_state,
-        ) <= 0
-    ):
-        if is_free:
-            pause_free_timer(user_id)
-        await q.answer("📡 Website round ပြောင်းသွားပါပြီ။ နောက် round ကို ပြန်တောင်းပါ။", show_alert=True)
-        return
-    website_state = latest_website_state
-    website_round_id = website_state["current_issue"]
-    website_end_ms = website_state["current_end_ms"]
-    website_fetched_at_ms = website_state["fetched_at_ms"]
-    website_remaining = website_remaining_seconds(
-        {"website_round_id": website_round_id},
-        website_state,
-    )
+    # Use the user's transaction number as the round identity immediately.
+    # track_round() will replace the provisional one-minute clock with the
+    # website's real clock/result as soon as that endpoint becomes available.
     issued_at = datetime.now(timezone.utc)
+    website_round_id = str(txn_no).strip() or issued_at.strftime("%Y%m%d%H%M%S")
+    website_fetched_at_ms = int(issued_at.timestamp() * 1000)
+    website_end_ms = website_fetched_at_ms + 60_000
+    website_remaining = 60
     round_end = datetime.fromtimestamp(website_end_ms / 1000, tz=timezone.utc)
+    logger.info(
+        "Sending source-based signal for transaction %s; website clock will be synced in background",
+        website_round_id,
+    )
     badge, confidence = signal_quality(signal)
     round_id = save_user_round(
         user_id,
