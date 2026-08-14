@@ -63,11 +63,10 @@ WEBSITE_URL = os.getenv(
     "WEBSITE_URL",
     "https://real-time-lottery-vision.lovable.app",
 ).rstrip("/")
-WEBSITE_SERVER_FN_HASH = os.getenv(
-    "WEBSITE_SERVER_FN_HASH",
-    "0ff380d0735568965e35a8fd1edb860e87cacd3e25bc6eb099bb7dac8ba6f633",
+WEBSITE_API_URL = os.getenv(
+    "WEBSITE_API_URL",
+    f"{WEBSITE_URL}/api/public/wingo-1m",
 ).strip()
-WEBSITE_SERVER_FN_URL = f"{WEBSITE_URL}/_serverFn/{WEBSITE_SERVER_FN_HASH}"
 WEBSITE_FETCH_TIMEOUT_SECONDS = 20
 COUNTDOWN_UPDATE_SECONDS = 3
 RESULT_POLL_MAX_ATTEMPTS = 40
@@ -516,9 +515,11 @@ def _epoch_milliseconds(value) -> int | None:
 
 def _normalise_website_state(payload) -> dict | None:
     decoded = _decode_website_payload(payload)
-    result = decoded.get("result") if isinstance(decoded, dict) else None
-    if not isinstance(result, dict):
+    if not isinstance(decoded, dict):
         return None
+    # The stable public endpoint returns the snapshot directly. Keep support
+    # for the old wrapped server-function payload while existing data drains.
+    result = decoded.get("result") if isinstance(decoded.get("result"), dict) else decoded
 
     current_issue = str(result.get("currentIssue") or "").strip()
     current_end_ms = _epoch_milliseconds(result.get("currentEndTime"))
@@ -553,33 +554,34 @@ def _normalise_website_state(payload) -> dict | None:
 
 
 async def fetch_website_state() -> dict | None:
-    """Read the website's actual server clock, round, and completed history."""
+    """Read the stable public JSON endpoint for round, clock, and history."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; DrThetPyinnSignalsBot/3.0)",
-        "Accept": "text/html,application/xhtml+xml,application/json",
+        "User-Agent": "DrThetPyinnSignalsBot/4.0",
+        "Accept": "application/json",
     }
-    server_headers = {
-        "User-Agent": headers["User-Agent"],
-        "Accept": "application/json, application/x-ndjson, application/x-tss-framed",
-        "Referer": f"{WEBSITE_URL}/",
-        "x-tsr-serverFn": "true",
-    }
-    try:
-        async with httpx.AsyncClient(
-            timeout=WEBSITE_FETCH_TIMEOUT_SECONDS,
-            follow_redirects=True,
-            headers=headers,
-        ) as client:
-            # The public host protects the server-function route with a browser
-            # session cookie, so establish the same session before reading data.
-            home = await client.get(f"{WEBSITE_URL}/")
-            home.raise_for_status()
-            response = await client.get(WEBSITE_SERVER_FN_URL, headers=server_headers)
-            response.raise_for_status()
-            return _normalise_website_state(response.json())
-    except (httpx.HTTPError, OSError, ValueError) as error:
-        logger.warning("Could not read website live state: %s", error)
-        return None
+    last_error = None
+    async with httpx.AsyncClient(
+        timeout=WEBSITE_FETCH_TIMEOUT_SECONDS,
+        follow_redirects=True,
+        headers=headers,
+    ) as client:
+        for attempt in range(3):
+            try:
+                response = await client.get(
+                    WEBSITE_API_URL,
+                    params={"ts": int(datetime.now(timezone.utc).timestamp() * 1000)},
+                )
+                response.raise_for_status()
+                state = _normalise_website_state(response.json())
+                if state:
+                    return state
+                last_error = ValueError("website API returned an invalid snapshot")
+            except (httpx.HTTPError, OSError, ValueError) as error:
+                last_error = error
+            if attempt < 2:
+                await asyncio.sleep(1 + attempt)
+    logger.warning("Could not read website live API %s: %s", WEBSITE_API_URL, last_error)
+    return None
 
 
 def website_remaining_seconds(item: dict, state: dict | None) -> int:
@@ -1450,10 +1452,33 @@ async def _send_signal(q, ctx: ContextTypes.DEFAULT_TYPE):
         await q.answer("🎁 ဒီနေ့ Free time ကုန်သွားပါပြီ။", show_alert=True)
         return
 
+    # Bind the prediction to the website's real round before sending it. This
+    # prevents a typed transaction number from being mistaken for a game round.
+    website_state = await fetch_website_state()
+    if not website_state:
+        if is_free:
+            pause_free_timer(user_id)
+        await q.answer("📡 Live game website ကို မဖတ်နိုင်သေးပါ။", show_alert=True)
+        await _send_text_retry(
+            ctx.bot,
+            q.message.chat_id,
+            "⚠️ Live round/clock မရသေးလို့ မှားယွင်းတဲ့ signal မပို့ဘဲ ရပ်ထားပါတယ်။\n"
+            "ခဏစောင့်ပြီး 1m ကို ပြန်နှိပ်ပေးပါ။",
+        )
+        return
+
+    website_remaining = max(
+        0,
+        int((website_state["current_end_ms"] - website_state["fetched_at_ms"] + 999) // 1000),
+    )
+    if website_remaining <= 5:
+        if is_free:
+            pause_free_timer(user_id)
+        await q.answer("⏳ Round ပြောင်းခါနီးပါပြီ။ ခဏစောင့်ပြီး ပြန်နှိပ်ပါ။", show_alert=True)
+        return
+
     # Signal direction still comes exclusively from the Telegram source channel.
-    # Do not block the signal on the website clock: the website is only used
-    # later for countdown and result settlement.
-    signal     = await generate_signal(txn_no)
+    signal = await generate_signal(txn_no)
     if not signal:
         if is_free:
             pause_free_timer(user_id)
@@ -1469,18 +1494,15 @@ async def _send_signal(q, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Use the user's transaction number as the round identity immediately.
-    # track_round() will replace the provisional one-minute clock with the
-    # website's real clock/result as soon as that endpoint becomes available.
     issued_at = datetime.now(timezone.utc)
-    website_round_id = str(txn_no).strip() or issued_at.strftime("%Y%m%d%H%M%S")
-    website_fetched_at_ms = int(issued_at.timestamp() * 1000)
-    website_end_ms = website_fetched_at_ms + 60_000
-    website_remaining = 60
+    website_round_id = str(website_state["current_issue"])
+    website_fetched_at_ms = int(website_state["fetched_at_ms"])
+    website_end_ms = int(website_state["current_end_ms"])
     round_end = datetime.fromtimestamp(website_end_ms / 1000, tz=timezone.utc)
     logger.info(
-        "Sending source-based signal for transaction %s; website clock will be synced in background",
+        "Sending source-based signal for website round %s (transaction %s)",
         website_round_id,
+        txn_no,
     )
     badge, confidence = signal_quality(signal)
     round_id = save_user_round(
