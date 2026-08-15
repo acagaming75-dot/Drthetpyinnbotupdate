@@ -553,8 +553,57 @@ def _normalise_website_state(payload) -> dict | None:
     }
 
 
+UPSTREAM_BASE_URL = os.getenv(
+    "UPSTREAM_BASE_URL",
+    "https://draw.ar-lottery01.com/TrxWinGo/TrxWinGo_1M",
+).rstrip("/")
+
+
+async def fetch_upstream_state(client: httpx.AsyncClient) -> dict | None:
+    """Read the game feed directly, so the bot works even if the website is down."""
+    ts = int(datetime.now(timezone.utc).timestamp() * 1000)
+    try:
+        state_res, hist_res = await asyncio.gather(
+            client.get(f"{UPSTREAM_BASE_URL}.json", params={"ts": ts}),
+            client.get(f"{UPSTREAM_BASE_URL}/GetHistoryIssuePage.json", params={"ts": ts}),
+        )
+        state_res.raise_for_status()
+        hist_res.raise_for_status()
+        state = state_res.json()
+        history = hist_res.json()
+    except (httpx.HTTPError, OSError, ValueError) as error:
+        logger.warning("Could not read upstream feed %s: %s", UPSTREAM_BASE_URL, error)
+        return None
+
+    current = (state or {}).get("current") or {}
+    current_issue = str(current.get("issueNumber") or "").strip()
+    current_end_ms = _epoch_milliseconds(current.get("endTime"))
+    if not current_issue or not current_end_ms:
+        return None
+
+    rows = []
+    for row in ((history or {}).get("data") or {}).get("list") or []:
+        issue = str(row.get("issueNumber") or "").strip()
+        if not issue:
+            continue
+        direction, actual = result_from_value(row.get("number"))
+        rows.append({
+            "issue_number": issue,
+            "number": actual,
+            "direction": direction,
+            "draw_time_ms": _epoch_milliseconds(row.get("blockTimestamp")),
+        })
+
+    return {
+        "current_issue": current_issue,
+        "current_end_ms": current_end_ms,
+        "fetched_at_ms": int(datetime.now(timezone.utc).timestamp() * 1000),
+        "rows": rows,
+    }
+
+
 async def fetch_website_state() -> dict | None:
-    """Read the stable public JSON endpoint for round, clock, and history."""
+    """Read the live round, clock, and history (website first, feed as backup)."""
     headers = {
         "User-Agent": "DrThetPyinnSignalsBot/4.0",
         "Accept": "application/json",
@@ -565,7 +614,7 @@ async def fetch_website_state() -> dict | None:
         follow_redirects=True,
         headers=headers,
     ) as client:
-        for attempt in range(3):
+        for attempt in range(2):
             try:
                 response = await client.get(
                     WEBSITE_API_URL,
@@ -578,9 +627,19 @@ async def fetch_website_state() -> dict | None:
                 last_error = ValueError("website API returned an invalid snapshot")
             except (httpx.HTTPError, OSError, ValueError) as error:
                 last_error = error
+            if attempt < 1:
+                await asyncio.sleep(1)
+
+        logger.warning(
+            "Website API unavailable (%s: %s) - falling back to the game feed",
+            WEBSITE_API_URL, last_error,
+        )
+        for attempt in range(3):
+            state = await fetch_upstream_state(client)
+            if state:
+                return state
             if attempt < 2:
                 await asyncio.sleep(1 + attempt)
-    logger.warning("Could not read website live API %s: %s", WEBSITE_API_URL, last_error)
     return None
 
 
