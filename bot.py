@@ -605,17 +605,6 @@ async def settle_channel_result(bot, transaction: str, direction: str, actual: s
 def build_round_caption(item: dict, remaining: int | None = None) -> str:
     signal = item.get("signal", "—")
     signal_txt = "🔴 BIG" if signal == "BIG" else "🔵 SMALL"
-    status = item.get("status", "OPEN")
-    result = item.get("result")
-    actual = item.get("actual")
-    if result == "WIN":
-        status_line = f"✅ *WIN*  (Result: {actual or signal})"
-    elif result == "LOSS":
-        status_line = f"❌ *LOSS* (Result: {actual or '—'})"
-    elif status == "OPEN" and remaining is not None:
-        status_line = f"⏳ *LIVE*  ({format_countdown(remaining)} remaining)"
-    else:
-        status_line = "📡 *RESULT PENDING*"
     return (
         "🎯 *Signal Result*\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
@@ -625,8 +614,7 @@ def build_round_caption(item: dict, remaining: int | None = None) -> str:
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 Direction        : *{signal_txt}*\n"
         f"🏷 Status           : *{item.get('badge', 'Weak')}*\n"
-        f"🎯 Confidence       : *{item.get('confidence', 50)}%*\n"
-        f"⏱ Round             : {status_line}"
+        f"🎯 Confidence       : *{item.get('confidence', 50)}%*"
     )
 
 
@@ -643,13 +631,6 @@ async def settle_round_now(
         return item
     direction, actual = await fetch_game_result(item.get("transaction", ""))
     if not direction:
-        if announce_pending:
-            await _send_text_retry(
-                bot,
-                chat_id,
-                "📡 ဒီ round ရဲ့ official result ကို မရသေးပါ။\n"
-                "Result ရလာတဲ့အခါ ပြန်စစ်နိုင်ပါတယ်။",
-            )
         return item
     result = "WIN" if direction == item.get("signal") else "LOSS"
     updated = update_user_round(
@@ -871,17 +852,10 @@ def kb_time_select():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏱ 1m", callback_data="time_1m")]])
 
 def kb_signal_actions(round_id: str | None = None):
-    check_button = (
-        [InlineKeyboardButton("🔍 Check Result", callback_data=f"check_result:{round_id}")]
-        if round_id
-        else []
-    )
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Change ID",  callback_data="change_id"),
         InlineKeyboardButton("➡️ Next Round", callback_data="next_round"),
-    ], [
-        InlineKeyboardButton("📈 My Record", callback_data="my_stats"),
-    ]] + ([check_button] if check_button else []))
+    ]])
 
 def kb_free_signal_actions(round_id: str | None = None):
     buttons = [
@@ -889,13 +863,8 @@ def kb_free_signal_actions(round_id: str | None = None):
             InlineKeyboardButton("🔄 Change ID", callback_data="change_id"),
             InlineKeyboardButton("➡️ Next Round", callback_data="next_round"),
         ],
-        [InlineKeyboardButton("📈 My Record", callback_data="my_stats")],
         [InlineKeyboardButton("⏸ Stop Free Timer", callback_data="stop_free")],
     ]
-    if round_id:
-        buttons.insert(2, [
-            InlineKeyboardButton("🔍 Check Result", callback_data=f"check_result:{round_id}")
-        ])
     return InlineKeyboardMarkup(buttons)
 
 def kb_admin():
@@ -1174,13 +1143,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "next_round":
         if not has_signal_access(user.id):
             await q.answer("❌ Access မရှိတော့ပါ။ Admin ထံဆက်သွယ်ပါ။", show_alert=True); return
-        if open_rounds(user.id):
-            await q.answer(
-                "⚠️ ပထမကစားပွဲ မပြီးသေးပါ။\n"
-                "1 Minute ပြည့်ပြီး WIN/LOSS ပြပြီးမှ Next Round ပြောင်းပါ။",
-                show_alert=True,
-            )
-            return
         new_txn = increment_txn_no(ctx.user_data.get("txn_no", ""))
         ctx.user_data["txn_no"] = new_txn
         ctx.user_data["state"]  = "selecting_time"
@@ -1192,65 +1154,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🎮 *Transaction no.:* `{new_txn}`\n\n⏱ *Timeframe ရွေးချယ်ပေးပါ:*",
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_time_select(),
         )
-        return
-
-    if data == "my_stats":
-        if not has_signal_access(user.id):
-            await q.answer("❌ Access မရှိတော့ပါ။ Admin ထံဆက်သွယ်ပါ။", show_alert=True)
-            return
-        for item in _user_rounds(user.id):
-            if item.get("status") == "OPEN" and _parse_utc(item.get("round_end")) <= datetime.now(timezone.utc):
-                await settle_round_now(
-                    ctx.bot,
-                    user.id,
-                    item.get("id", ""),
-                    q.message.chat_id,
-                    announce_pending=False,
-                )
-        if q.message.photo:
-            await q.edit_message_caption(
-                caption=stats_text(user.id),
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb_signal_actions(),
-            )
-        else:
-            await q.edit_message_text(
-                text=stats_text(user.id),
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb_signal_actions(),
-            )
-        return
-
-    if data.startswith("check_result:"):
-        if not has_signal_access(user.id):
-            await q.answer("❌ Access မရှိတော့ပါ။ Admin ထံဆက်သွယ်ပါ။", show_alert=True)
-            return
-        round_id = data.split(":", 1)[1]
-        item = get_user_round(user.id, round_id)
-        if not item:
-            await q.answer("❌ ဒီ round မှတ်တမ်း မတွေ့ပါ။", show_alert=True)
-            return
-        if item.get("status") == "OPEN" and _parse_utc(item.get("round_end")) > datetime.now(timezone.utc):
-            remaining = int((_parse_utc(item.get("round_end")) - datetime.now(timezone.utc)).total_seconds() + 0.999)
-            await q.answer(
-                f"⏳ Round မပြီးသေးပါ။ {format_countdown(remaining)} ကျန်ပါသေးတယ်။",
-                show_alert=True,
-            )
-            return
-        updated = await settle_round_now(
-            ctx.bot,
-            user.id,
-            round_id,
-            q.message.chat_id,
-            announce_pending=False,
-        )
-        if updated and updated.get("result") in {"WIN", "LOSS"}:
-            await q.answer(f"{'✅ WIN' if updated['result'] == 'WIN' else '❌ LOSS'} ပြီးပါပြီ။", show_alert=True)
-        else:
-            await q.answer(
-                "📡 Official result မရသေးပါ။ နောက်မှ ပြန်စစ်ပါ။",
-                show_alert=True,
-            )
         return
 
     if data == "stop_free":
@@ -1309,7 +1212,7 @@ async def _send_signal(q, ctx: ContextTypes.DEFAULT_TYPE):
     save_signal_to_history(signal, txn_no=txn_no, prediction_id=round_id)
     item = get_user_round(user_id, round_id) or {}
     img_name   = "big" if signal == "BIG" else "small"
-    caption = build_round_caption(item, ROUND_SECONDS)
+    caption = build_round_caption(item)
     try: await q.message.delete()
     except Exception: pass
     try:
@@ -1330,11 +1233,6 @@ async def _send_signal(q, ctx: ContextTypes.DEFAULT_TYPE):
             round_id,
             message_id=sent.message_id,
             chat_id=q.message.chat_id,
-        )
-        ctx.application.create_task(
-            track_round(ctx.bot, user_id, round_id, q.message.chat_id),
-            update=None,
-            name=f"track-round-{user_id}-{round_id}",
         )
     except Exception:
         logger.exception(f"Could not send signal to {user_id}")
@@ -1556,7 +1454,6 @@ async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "Bot စတင်ရန် / ကြိုဆိုစာ"),
         BotCommand("myid",  "သင်၏ Telegram ID ကြည့်ရန်"),
-        BotCommand("stats", "WIN/LOSS နှင့် Win rate ကြည့်ရန်"),
     ])
     for admin_id in ADMIN_IDS:
         await _set_admin_commands(app.bot, admin_id)
@@ -1567,7 +1464,6 @@ def main():
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("myid",  cmd_myid))
-    app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(
