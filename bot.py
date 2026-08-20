@@ -609,7 +609,6 @@ def build_round_caption(item: dict, remaining: int | None = None) -> str:
         "🎯 *Signal Result*\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"🎮 Transaction no. : `{item.get('transaction', '—')}`\n"
-        "⏱ Timeframe        : 1 Minute\n"
         f"🕐 Time             : {item.get('issued_at', '')[:19].replace('T', ' ')} UTC\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 Direction        : *{signal_txt}*\n"
@@ -849,7 +848,7 @@ def kb_vip_required():
     ]])
 
 def kb_time_select():
-    return InlineKeyboardMarkup([[InlineKeyboardButton("⏱ 1m", callback_data="time_1m")]])
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🎯 Get Signal", callback_data="get_signal")]])
 
 def kb_signal_actions(round_id: str | None = None):
     return InlineKeyboardMarkup([[
@@ -1082,7 +1081,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["txn_no"] = text
         ctx.user_data["state"]  = "selecting_time"
         await update.message.reply_text(
-            f"🎮 *Transaction no.:* `{text}`\n\n⏱ *Timeframe ရွေးချယ်ပေးပါ:*",
+            f"🎮 *Transaction no.:* `{text}`\n\n🎯 Signal ရယူရန် ခလုတ်ကိုနှိပ်ပါ:",
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_time_select(),
         )
         return
@@ -1094,7 +1093,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["txn_no"] = text
     ctx.user_data["state"]  = "selecting_time"
     await update.message.reply_text(
-        f"🎮 *Transaction no.:* `{text}`\n\n⏱ *Timeframe ရွေးချယ်ပေးပါ:*",
+        f"🎮 *Transaction no.:* `{text}`\n\n🎯 Signal ရယူရန် ခလုတ်ကိုနှိပ်ပါ:",
         parse_mode=ParseMode.MARKDOWN, reply_markup=kb_time_select(),
     )
 
@@ -1123,7 +1122,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = q.data
     await q.answer()
 
-    if data == "time_1m":
+    if data in {"get_signal", "time_1m"}:
         if not has_signal_access(user.id):
             await q.answer("❌ Access မရှိတော့ပါ။ Admin ထံဆက်သွယ်ပါ။", show_alert=True); return
         await _send_signal(q, ctx); return
@@ -1145,15 +1144,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer("❌ Access မရှိတော့ပါ။ Admin ထံဆက်သွယ်ပါ။", show_alert=True); return
         new_txn = increment_txn_no(ctx.user_data.get("txn_no", ""))
         ctx.user_data["txn_no"] = new_txn
-        ctx.user_data["state"]  = "selecting_time"
-        try: await q.message.delete()
-        except Exception: pass
-        await _send_text_retry(
-            ctx.bot,
-            q.message.chat_id,
-            f"🎮 *Transaction no.:* `{new_txn}`\n\n⏱ *Timeframe ရွေးချယ်ပေးပါ:*",
-            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_time_select(),
-        )
+        await _send_signal(q, ctx)
         return
 
     if data == "stop_free":
