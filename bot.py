@@ -57,20 +57,14 @@ SIGNAL_HIST_FILE = DATA_DIR / "signal_history.json"
 SOURCE_HIST_FILE = DATA_DIR / "source_history.json"
 USER_ROUNDS_FILE = DATA_DIR / "user_rounds.json"
 
-# The public website is used only for the live round clock, round ID, history,
-# and settled result.  It is deliberately not consulted when choosing a signal.
-WEBSITE_URL = os.getenv(
-    "WEBSITE_URL",
-    "https://real-time-lottery-vision.lovable.app",
-).rstrip("/")
-WEBSITE_SERVER_FN_HASH = os.getenv(
-    "WEBSITE_SERVER_FN_HASH",
-    "0ff380d0735568965e35a8fd1edb860e87cacd3e25bc6eb099bb7dac8ba6f633",
-).strip()
-WEBSITE_SERVER_FN_URL = f"{WEBSITE_URL}/_serverFn/{WEBSITE_SERVER_FN_HASH}"
-WEBSITE_FETCH_TIMEOUT_SECONDS = 20
-COUNTDOWN_UPDATE_SECONDS = 3
-RESULT_POLL_MAX_ATTEMPTS = 40
+# The official game result endpoint is not exposed by the public web page in
+# every deployment.  When GAME_HISTORY_URL is supplied, the bot uses it for
+# automatic WIN/LOSS settlement.  The URL may contain {txn}; otherwise the
+# transaction number is also sent as the `txn` query parameter.
+GAME_HISTORY_URL = os.getenv("GAME_HISTORY_URL", "").strip()
+ROUND_SECONDS = 60
+RESULT_GRACE_SECONDS = 8
+COUNTDOWN_UPDATE_SECONDS = 1
 
 # The four bot images are embedded in this file so no images folder is needed.
 EMBEDDED_IMAGES = {
@@ -361,31 +355,19 @@ def save_user_round(
     confidence: int,
     issued_at: datetime,
     round_end: datetime,
-    website_round_id: str | None = None,
-    website_end_ms: int | None = None,
-    website_fetched_at_ms: int | None = None,
-    access_type: str = "VIP",
-    signal_mode: str = "REVERSE",
 ) -> str:
     """Persist a prediction before sending it so results survive restarts."""
     round_id = issued_at.strftime("%Y%m%d%H%M%S%f")
-    website_round_id = str(website_round_id or txn_no).strip()
     data = load_user_rounds()
     rounds = data.setdefault(str(user_id), [])
     rounds.append({
         "id": round_id,
         "transaction": txn_no,
-        "round_id": website_round_id,
-        "website_round_id": website_round_id,
         "signal": signal,
-        "signal_mode": signal_mode,
         "badge": badge,
         "confidence": confidence,
         "issued_at": issued_at.isoformat(),
         "round_end": round_end.isoformat(),
-        "round_end_ms": website_end_ms,
-        "website_fetched_at_ms": website_fetched_at_ms,
-        "access_type": access_type,
         "status": "OPEN",
         "result": None,
         "actual": None,
@@ -418,10 +400,11 @@ def get_user_round(user_id: int, round_id: str) -> dict | None:
 
 
 def open_rounds(user_id: int) -> list:
+    now = datetime.now(timezone.utc)
     return [
         item for item in _user_rounds(user_id)
-        if item.get("status") in {"OPEN", "PENDING"}
-        and item.get("result") not in {"WIN", "LOSS"}
+        if item.get("status") == "OPEN"
+        and _parse_utc(item.get("round_end")) > now
     ]
 
 
@@ -474,133 +457,56 @@ def _walk_result_records(value):
             yield from _walk_result_records(child)
 
 
-def _decode_website_payload(value, refs: dict | None = None):
-    """Decode the serialized response used by the website's server function."""
-    refs = refs if refs is not None else {}
-    if not isinstance(value, dict):
-        return value
-
-    tag = value.get("t")
-    if tag in {0, 1}:
-        return value.get("s")
-    if tag == 2:
-        return None
-    if tag == 9:
-        result = []
-        if value.get("i") is not None:
-            refs[value["i"]] = result
-        result.extend(_decode_website_payload(item, refs) for item in value.get("a", []))
-        return result
-    if tag == 10:
-        result = {}
-        if value.get("i") is not None:
-            refs[value["i"]] = result
-        packed = value.get("p") or {}
-        for key, item in zip(packed.get("k", []), packed.get("v", [])):
-            result[key] = _decode_website_payload(item, refs)
-        return result
-    if tag == 11:
-        return {}
-    if "r" in value and value["r"] in refs:
-        return refs[value["r"]]
-    return value
-
-
-def _epoch_milliseconds(value) -> int | None:
-    try:
-        number = int(value)
-    except (TypeError, ValueError):
-        return None
-    return number * 1000 if number < 10**12 else number
-
-
-def _normalise_website_state(payload) -> dict | None:
-    decoded = _decode_website_payload(payload)
-    result = decoded.get("result") if isinstance(decoded, dict) else None
-    if not isinstance(result, dict):
-        return None
-
-    current_issue = str(result.get("currentIssue") or "").strip()
-    current_end_ms = _epoch_milliseconds(result.get("currentEndTime"))
-    fetched_at_ms = _epoch_milliseconds(result.get("fetchedAt"))
-    rows = result.get("rows")
-    if not current_issue or not current_end_ms or not isinstance(rows, list):
-        return None
-
-    clean_rows = []
-    for row in rows:
-        if not isinstance(row, dict):
+def _result_for_transaction(payload, txn_no: str) -> tuple[str | None, str | None]:
+    txn = str(txn_no).strip()
+    for item in _walk_result_records(payload):
+        identifiers = " ".join(
+            str(item.get(key, "")) for key in (
+                "transaction", "transactionNo", "transaction_no",
+                "period", "issue", "issueNumber", "round", "roundNo",
+                "id", "gameId",
+            )
+        )
+        if txn not in identifiers:
             continue
-        issue = str(row.get("issueNumber") or "").strip()
-        if not issue:
-            continue
-        direction, actual = result_from_value(row.get("number"))
-        if not direction:
-            direction, actual = result_from_value(row.get("bigSmall"))
-        clean_rows.append({
-            "issue_number": issue,
-            "number": actual,
-            "direction": direction,
-            "draw_time_ms": _epoch_milliseconds(row.get("drawTime")),
-        })
-
-    return {
-        "current_issue": current_issue,
-        "current_end_ms": current_end_ms,
-        "fetched_at_ms": fetched_at_ms or int(datetime.now(timezone.utc).timestamp() * 1000),
-        "rows": clean_rows,
-    }
+        for key in ("result", "number", "num", "openNumber", "winningNumber", "value", "code"):
+            if key in item:
+                direction, actual = result_from_value(item[key])
+                if direction:
+                    return direction, actual
+        direction, actual = result_from_value(item)
+        if direction:
+            return direction, actual
+    return None, None
 
 
-async def fetch_website_state() -> dict | None:
-    """Read the website's actual server clock, round, and completed history."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; DrThetPyinnSignalsBot/3.0)",
-        "Accept": "text/html,application/xhtml+xml,application/json",
-    }
-    server_headers = {
-        "User-Agent": headers["User-Agent"],
-        "Accept": "application/json, application/x-ndjson, application/x-tss-framed",
-        "Referer": f"{WEBSITE_URL}/",
-        "x-tsr-serverFn": "true",
+async def fetch_game_result(txn_no: str) -> tuple[str | None, str | None]:
+    """Best-effort result lookup; unavailable endpoints never create a result."""
+    if not GAME_HISTORY_URL:
+        return None, None
+    url = GAME_HISTORY_URL.replace("{txn}", quote(str(txn_no), safe=""))
+    params = {} if "{txn}" in GAME_HISTORY_URL else {
+        "txn": txn_no,
+        "transactionNo": txn_no,
+        "period": txn_no,
+        "issue": txn_no,
     }
     try:
         async with httpx.AsyncClient(
-            timeout=WEBSITE_FETCH_TIMEOUT_SECONDS,
+            timeout=CHANNEL_FETCH_TIMEOUT_SECONDS,
             follow_redirects=True,
-            headers=headers,
+            headers={"User-Agent": "DrThetPyinnSignalBot/2.0"},
         ) as client:
-            # The public host protects the server-function route with a browser
-            # session cookie, so establish the same session before reading data.
-            home = await client.get(f"{WEBSITE_URL}/")
-            home.raise_for_status()
-            response = await client.get(WEBSITE_SERVER_FN_URL, headers=server_headers)
+            response = await client.get(url, params=params)
             response.raise_for_status()
-            return _normalise_website_state(response.json())
-    except (httpx.HTTPError, OSError, ValueError) as error:
-        logger.warning("Could not read website live state: %s", error)
-        return None
-
-
-def website_remaining_seconds(item: dict, state: dict | None) -> int:
-    """Calculate remaining time from the website's server timestamp, not 60s."""
-    if not state:
-        return 0
-    website_round_id = str(item.get("website_round_id") or item.get("round_id") or "")
-    if website_round_id and website_round_id != state.get("current_issue"):
-        return 0
-    remaining_ms = int(state["current_end_ms"]) - int(state["fetched_at_ms"])
-    return max(0, int((remaining_ms + 999) // 1000))
-
-
-def website_result_for_round(round_id: str, state: dict | None) -> tuple[str | None, str | None]:
-    if not state:
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = response.text
+        return _result_for_transaction(payload, txn_no)
+    except (httpx.HTTPError, OSError) as error:
+        logger.warning("Could not read game result for %s: %s", txn_no, error)
         return None, None
-    wanted = str(round_id).strip()
-    for row in state.get("rows", []):
-        if row.get("issue_number") == wanted:
-            return row.get("direction"), row.get("number")
-    return None, None
 
 
 def signal_quality(signal: str) -> tuple[str, int]:
@@ -652,6 +558,50 @@ def parse_transaction_from_text(text: str) -> str | None:
     return match.group(1) if match else None
 
 
+def parse_result_from_text(text: str) -> tuple[str | None, str | None]:
+    """Only parse an outcome when the post explicitly labels it as a result."""
+    cleaned = unescape(re.sub(r"<[^>]+>", " ", text or ""))
+    match = re.search(
+        r"(?:RESULT|OPEN(?:ING)?\s+NUMBER|WINNING\s+NUMBER|ACTUAL)"
+        r"\s*[:#-]?\s*(BIG|SMALL|\d+)",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    return result_from_value(match.group(1)) if match else (None, None)
+
+
+async def settle_channel_result(bot, transaction: str, direction: str, actual: str | None):
+    """Settle every user's open prediction for an explicitly labelled result post."""
+    for user_id, rounds in load_user_rounds().items():
+        for item in rounds if isinstance(rounds, list) else []:
+            if (
+                item.get("status") == "OPEN"
+                and str(item.get("transaction", "")).strip() == str(transaction).strip()
+            ):
+                result = "WIN" if item.get("signal") == direction else "LOSS"
+                updated = update_user_round(
+                    int(user_id),
+                    item.get("id", ""),
+                    status=result,
+                    result=result,
+                    actual=actual or direction,
+                    settled_at=datetime.now(timezone.utc).isoformat(),
+                    settled_by="telegram_source",
+                )
+                settle_signal_history(item.get("id", ""), result, actual or direction)
+                if updated and updated.get("message_id"):
+                    try:
+                        await bot.edit_message_caption(
+                            chat_id=updated.get("chat_id", int(user_id)),
+                            message_id=updated["message_id"],
+                            caption=build_round_caption(updated),
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=kb_signal_actions(),
+                        )
+                    except Exception as error:
+                        logger.warning("Could not show channel-settled result: %s", error)
+
+
 def build_round_caption(item: dict, remaining: int | None = None) -> str:
     signal = item.get("signal", "—")
     signal_txt = "🔴 BIG" if signal == "BIG" else "🔵 SMALL"
@@ -670,7 +620,6 @@ def build_round_caption(item: dict, remaining: int | None = None) -> str:
         "🎯 *Signal Result*\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"🎮 Transaction no. : `{item.get('transaction', '—')}`\n"
-        f"🆔 Round ID        : `{item.get('website_round_id') or item.get('round_id', '—')}`\n"
         "⏱ Timeframe        : 1 Minute\n"
         f"🕐 Time             : {item.get('issued_at', '')[:19].replace('T', ' ')} UTC\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
@@ -688,63 +637,20 @@ async def settle_round_now(
     chat_id: int,
     *,
     announce_pending: bool = True,
-    state: dict | None = None,
 ) -> dict | None:
     item = get_user_round(user_id, round_id)
     if not item or item.get("result") in {"WIN", "LOSS"}:
         return item
-
-    state = state or await fetch_website_state()
-    if not state:
-        if announce_pending:
-            await _send_text_retry(
-                bot,
-                chat_id,
-                "📡 Website result မရသေးပါ။\n"
-                "Fake WIN/LOSS မပြဘဲ RESULT PENDING အဖြစ် စောင့်နေပါတယ်။",
-            )
-        return item
-    remaining = website_remaining_seconds(item, state)
-    if remaining > 0:
-        if announce_pending:
-            await _send_text_retry(
-                bot,
-                chat_id,
-                f"⏳ ဒီ round မပြီးသေးပါ။ {format_countdown(remaining)} ကျန်ပါသေးတယ်။",
-            )
-        return item
-
-    website_round_id = item.get("website_round_id") or item.get("round_id")
-    direction, actual = website_result_for_round(website_round_id, state)
+    direction, actual = await fetch_game_result(item.get("transaction", ""))
     if not direction:
-        updated = update_user_round(
-            user_id,
-            round_id,
-            status="PENDING",
-            result=None,
-            actual=None,
-            settled_by=None,
-        ) or item
-        if updated.get("message_id"):
-            try:
-                await bot.edit_message_caption(
-                    chat_id=chat_id,
-                    message_id=updated["message_id"],
-                    caption=build_round_caption(updated),
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=round_action_keyboard(updated),
-                )
-            except Exception as error:
-                logger.warning("Could not show pending website result: %s", error)
         if announce_pending:
             await _send_text_retry(
                 bot,
                 chat_id,
-                "📡 Website result မရသေးပါ။\n"
-                "Fake WIN/LOSS မပြဘဲ RESULT PENDING အဖြစ် သိမ်းထားပါတယ်။",
+                "📡 ဒီ round ရဲ့ official result ကို မရသေးပါ။\n"
+                "Result ရလာတဲ့အခါ ပြန်စစ်နိုင်ပါတယ်။",
             )
-        return updated
-
+        return item
     result = "WIN" if direction == item.get("signal") else "LOSS"
     updated = update_user_round(
         user_id,
@@ -753,7 +659,7 @@ async def settle_round_now(
         result=result,
         actual=actual or direction,
         settled_at=datetime.now(timezone.utc).isoformat(),
-        settled_by="website",
+        settled_by="game_history",
     )
     settle_signal_history(round_id, result, actual or direction)
     if updated:
@@ -765,7 +671,7 @@ async def settle_round_now(
                     message_id=message_id,
                     caption=build_round_caption(updated),
                     parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=round_action_keyboard(updated),
+                    reply_markup=kb_signal_actions(round_id),
                 )
             except Exception as error:
                 logger.warning("Could not update settled signal message: %s", error)
@@ -773,43 +679,28 @@ async def settle_round_now(
 
 
 async def track_round(bot, user_id: int, round_id: str, chat_id: int):
-    """Keep the message synced with the website timer until a real result exists."""
+    """Keep the Telegram signal message in sync with the 1-minute round."""
     item = get_user_round(user_id, round_id)
     if not item:
         return
     message_id = item.get("message_id")
     if not message_id:
         return
-    missing_result_attempts = 0
+    end_at = _parse_utc(item.get("round_end"))
     while True:
         item = get_user_round(user_id, round_id)
         if not item or item.get("result") in {"WIN", "LOSS"}:
             return
-        state = await fetch_website_state()
-        remaining = website_remaining_seconds(item, state)
+        remaining = int((end_at - datetime.now(timezone.utc)).total_seconds() + 0.999)
         if remaining <= 0:
-            item = await settle_round_now(
-                bot,
-                user_id,
-                round_id,
-                chat_id,
-                announce_pending=False,
-                state=state,
-            )
-            if item and item.get("result") in {"WIN", "LOSS"}:
-                return
-            missing_result_attempts += 1
-            if missing_result_attempts >= RESULT_POLL_MAX_ATTEMPTS:
-                return
-        else:
-            missing_result_attempts = 0
+            break
         try:
             await bot.edit_message_caption(
                 chat_id=chat_id,
                 message_id=message_id,
                 caption=build_round_caption(item, remaining),
                 parse_mode=ParseMode.MARKDOWN,
-                reply_markup=round_action_keyboard(item),
+                reply_markup=kb_signal_actions(round_id),
             )
         except RetryAfter as error:
             await asyncio.sleep(min(max(1, int(error.retry_after)), 10))
@@ -818,6 +709,8 @@ async def track_round(bot, user_id: int, round_id: str, chat_id: int):
             await asyncio.sleep(2)
         else:
             await asyncio.sleep(COUNTDOWN_UPDATE_SECONDS)
+    await asyncio.sleep(RESULT_GRACE_SECONDS)
+    await settle_round_now(bot, user_id, round_id, chat_id, announce_pending=True)
 
 def parse_signal_from_text(text: str) -> str | None:
     cleaned = unescape(re.sub(r"<[^>]+>", " ", text)).upper()
@@ -931,24 +824,8 @@ def get_recent_streak() -> tuple[str, int]:
 
 # ── Core signal generator ──────────────────────────────────────────────────────
 
-def next_signal_mode(user_id: int) -> str:
-    """Alternate between REVERSE and DIRECT for every new round of a user.
-
-    One round is the reverse of the source channel signal, the next round is
-    exactly the same as the source channel signal, and so on.
-    """
-    for item in reversed(_user_rounds(user_id)):
-        mode = item.get("signal_mode")
-        if mode in {"REVERSE", "DIRECT"}:
-            return "DIRECT" if mode == "REVERSE" else "REVERSE"
-    return "REVERSE"
-
-
-async def generate_signal(txn_no: str, user_id: int) -> tuple[str, str] | None:
-    """Return (signal, mode) built from the latest public source signal.
-
-    The mode alternates per user: REVERSE (opposite of the channel) then
-    DIRECT (same as the channel), then REVERSE again.
+async def generate_signal(txn_no: str) -> str | None:
+    """Return alternating reverse/source signals from the latest source signal.
 
     There is intentionally no random or hash fallback. A missing source signal
     must never become a fabricated trading direction.
@@ -958,13 +835,19 @@ async def generate_signal(txn_no: str, user_id: int) -> tuple[str, str] | None:
     if not ch_sig:
         logger.warning("Signal unavailable because source signal is unavailable")
         return None
-    mode = next_signal_mode(user_id)
-    if mode == "REVERSE":
-        signal = "SMALL" if ch_sig == "BIG" else "BIG"
-    else:
-        signal = ch_sig
-    logger.info("Public channel %s: %s → %s", mode.lower(), ch_sig, signal)
-    return signal, mode
+    # Keep the existing reverse behavior for the first signal, then alternate
+    # between reverse and the source direction on every subsequent signal.
+    # The history file makes the turn order survive bot restarts.
+    signal_number = len(load_signal_history())
+    is_reverse_turn = signal_number % 2 == 0
+    signal = (
+        ("SMALL" if ch_sig == "BIG" else "BIG")
+        if is_reverse_turn
+        else ch_sig
+    )
+    mode = "reverse" if is_reverse_turn else "source"
+    logger.info("Public channel %s turn: %s → %s", mode, ch_sig, signal)
+    return signal
 
 def increment_txn_no(txn_no: str) -> str:
     txn_no = txn_no.strip()
@@ -987,26 +870,24 @@ def kb_vip_required():
 def kb_time_select():
     return InlineKeyboardMarkup([[InlineKeyboardButton("⏱ 1m", callback_data="time_1m")]])
 
-def kb_signal_actions(round_id: str | None = None, next_round_locked: bool = False):
+def kb_signal_actions(round_id: str | None = None):
     check_button = (
         [InlineKeyboardButton("🔍 Check Result", callback_data=f"check_result:{round_id}")]
         if round_id
         else []
     )
-    next_round_text = "🔒 Next Round" if next_round_locked else "➡️ Next Round"
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("🔄 Change ID",  callback_data="change_id"),
-        InlineKeyboardButton(next_round_text, callback_data="next_round"),
+        InlineKeyboardButton("➡️ Next Round", callback_data="next_round"),
     ], [
         InlineKeyboardButton("📈 My Record", callback_data="my_stats"),
     ]] + ([check_button] if check_button else []))
 
-def kb_free_signal_actions(round_id: str | None = None, next_round_locked: bool = False):
-    next_round_text = "🔒 Next Round" if next_round_locked else "➡️ Next Round"
+def kb_free_signal_actions(round_id: str | None = None):
     buttons = [
         [
             InlineKeyboardButton("🔄 Change ID", callback_data="change_id"),
-            InlineKeyboardButton(next_round_text, callback_data="next_round"),
+            InlineKeyboardButton("➡️ Next Round", callback_data="next_round"),
         ],
         [InlineKeyboardButton("📈 My Record", callback_data="my_stats")],
         [InlineKeyboardButton("⏸ Stop Free Timer", callback_data="stop_free")],
@@ -1016,14 +897,6 @@ def kb_free_signal_actions(round_id: str | None = None, next_round_locked: bool 
             InlineKeyboardButton("🔍 Check Result", callback_data=f"check_result:{round_id}")
         ])
     return InlineKeyboardMarkup(buttons)
-
-
-def round_action_keyboard(item: dict):
-    locked = item.get("result") not in {"WIN", "LOSS"}
-    round_id = item.get("id")
-    if item.get("access_type") == "FREE":
-        return kb_free_signal_actions(round_id, next_round_locked=locked)
-    return kb_signal_actions(round_id, next_round_locked=locked)
 
 def kb_admin():
     return InlineKeyboardMarkup([
@@ -1184,11 +1057,14 @@ async def handle_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not post:
         return
     post_text = (post.text or post.caption or "").strip()
-    # The source channel is used only for the original signal direction.
-    # WIN/LOSS is settled exclusively from the website's completed history.
-    sig = parse_signal_from_text(post_text)
-    if sig:
-        save_channel_signal(sig)
+    result_direction, actual = parse_result_from_text(post_text)
+    transaction = parse_transaction_from_text(post_text)
+    if result_direction and transaction:
+        await settle_channel_result(ctx.bot, transaction, result_direction, actual)
+    else:
+        sig = parse_signal_from_text(post_text)
+        if sig:
+            save_channel_signal(sig)
 
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1197,7 +1073,10 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _deny_non_vip(update)
         return
     for item in _user_rounds(user.id):
-        if item.get("status") in {"OPEN", "PENDING"} and item.get("result") not in {"WIN", "LOSS"}:
+        if (
+            item.get("status") == "OPEN"
+            and _parse_utc(item.get("round_end")) <= datetime.now(timezone.utc)
+        ):
             await settle_round_now(
                 ctx.bot,
                 user.id,
@@ -1295,18 +1174,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "next_round":
         if not has_signal_access(user.id):
             await q.answer("❌ Access မရှိတော့ပါ။ Admin ထံဆက်သွယ်ပါ။", show_alert=True); return
-        for active_item in _user_rounds(user.id):
-            if active_item.get("status") in {"OPEN", "PENDING"} and active_item.get("result") not in {"WIN", "LOSS"}:
-                await settle_round_now(
-                    ctx.bot,
-                    user.id,
-                    active_item.get("id", ""),
-                    q.message.chat_id,
-                    announce_pending=False,
-                )
         if open_rounds(user.id):
             await q.answer(
-                "ပထမကစားပွဲ မပြီးသေးပါ။ WIN/LOSS ပြပြီးမှ Next Round ပြောင်းနိုင်ပါမည်။",
+                "⚠️ ပထမကစားပွဲ မပြီးသေးပါ။\n"
+                "1 Minute ပြည့်ပြီး WIN/LOSS ပြပြီးမှ Next Round ပြောင်းပါ။",
                 show_alert=True,
             )
             return
@@ -1328,7 +1199,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer("❌ Access မရှိတော့ပါ။ Admin ထံဆက်သွယ်ပါ။", show_alert=True)
             return
         for item in _user_rounds(user.id):
-            if item.get("status") in {"OPEN", "PENDING"} and item.get("result") not in {"WIN", "LOSS"}:
+            if item.get("status") == "OPEN" and _parse_utc(item.get("round_end")) <= datetime.now(timezone.utc):
                 await settle_round_now(
                     ctx.bot,
                     user.id,
@@ -1359,9 +1230,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not item:
             await q.answer("❌ ဒီ round မှတ်တမ်း မတွေ့ပါ။", show_alert=True)
             return
-        state = await fetch_website_state()
-        remaining = website_remaining_seconds(item, state)
-        if remaining > 0:
+        if item.get("status") == "OPEN" and _parse_utc(item.get("round_end")) > datetime.now(timezone.utc):
+            remaining = int((_parse_utc(item.get("round_end")) - datetime.now(timezone.utc)).total_seconds() + 0.999)
             await q.answer(
                 f"⏳ Round မပြီးသေးပါ။ {format_countdown(remaining)} ကျန်ပါသေးတယ်။",
                 show_alert=True,
@@ -1373,7 +1243,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             round_id,
             q.message.chat_id,
             announce_pending=False,
-            state=state,
         )
         if updated and updated.get("result") in {"WIN", "LOSS"}:
             await q.answer(f"{'✅ WIN' if updated['result'] == 'WIN' else '❌ LOSS'} ပြီးပါပြီ။", show_alert=True)
@@ -1407,48 +1276,11 @@ async def _send_signal(q, ctx: ContextTypes.DEFAULT_TYPE):
     txn_no     = ctx.user_data.get("txn_no", "???")
     user_id    = q.from_user.id
     is_free    = not is_vip(user_id)
-    for active_item in _user_rounds(user_id):
-        if active_item.get("status") in {"OPEN", "PENDING"} and active_item.get("result") not in {"WIN", "LOSS"}:
-            await settle_round_now(
-                ctx.bot,
-                user_id,
-                active_item.get("id", ""),
-                q.message.chat_id,
-                announce_pending=False,
-            )
-    if open_rounds(user_id):
-        await q.answer(
-            "ပထမကစားပွဲ မပြီးသေးပါ။ WIN/LOSS ပြပြီးမှ Next Round ပြောင်းနိုင်ပါမည်။",
-            show_alert=True,
-        )
-        return
     if is_free and not start_free_timer(user_id):
         await q.answer("🎁 ဒီနေ့ Free time ကုန်သွားပါပြီ။", show_alert=True)
         return
-
-    website_state = await fetch_website_state()
-    if not website_state:
-        if is_free:
-            pause_free_timer(user_id)
-        await q.answer("📡 Website live round မရသေးပါ။ ခဏစောင့်ပြီး ပြန်စမ်းပါ။", show_alert=True)
-        return
-
-    website_round_id = website_state["current_issue"]
-    website_end_ms = website_state["current_end_ms"]
-    website_fetched_at_ms = website_state["fetched_at_ms"]
-    website_remaining = website_remaining_seconds(
-        {"website_round_id": website_round_id},
-        website_state,
-    )
-    if website_remaining <= 0:
-        if is_free:
-            pause_free_timer(user_id)
-        await q.answer("📡 Website ရဲ့ Next Round ကို မရသေးပါ။ ခဏစောင့်ပြီး ပြန်စမ်းပါ။", show_alert=True)
-        return
-
-    # Signal direction still comes exclusively from the Telegram source channel.
-    generated  = await generate_signal(txn_no, user_id)
-    if not generated:
+    signal     = await generate_signal(txn_no)
+    if not signal:
         if is_free:
             pause_free_timer(user_id)
         await q.answer(
@@ -1462,34 +1294,8 @@ async def _send_signal(q, ctx: ContextTypes.DEFAULT_TYPE):
             "Random signal မထုတ်ဘဲ source ပြန်ရတဲ့အထိ ခဏစောင့်ပြီး ပြန်တောင်းပေးပါ။",
         )
         return
-
-    signal, signal_mode = generated
-
-    # Re-read the website after the channel fetch so the saved round is still
-    # the currently open website round, even if the source request took time.
-    latest_website_state = await fetch_website_state()
-    if (
-        not latest_website_state
-        or latest_website_state["current_issue"] != website_round_id
-        or website_remaining_seconds(
-            {"website_round_id": latest_website_state["current_issue"]},
-            latest_website_state,
-        ) <= 0
-    ):
-        if is_free:
-            pause_free_timer(user_id)
-        await q.answer("📡 Website round ပြောင်းသွားပါပြီ။ နောက် round ကို ပြန်တောင်းပါ။", show_alert=True)
-        return
-    website_state = latest_website_state
-    website_round_id = website_state["current_issue"]
-    website_end_ms = website_state["current_end_ms"]
-    website_fetched_at_ms = website_state["fetched_at_ms"]
-    website_remaining = website_remaining_seconds(
-        {"website_round_id": website_round_id},
-        website_state,
-    )
     issued_at = datetime.now(timezone.utc)
-    round_end = datetime.fromtimestamp(website_end_ms / 1000, tz=timezone.utc)
+    round_end = issued_at + timedelta(seconds=ROUND_SECONDS)
     badge, confidence = signal_quality(signal)
     round_id = save_user_round(
         user_id,
@@ -1499,15 +1305,11 @@ async def _send_signal(q, ctx: ContextTypes.DEFAULT_TYPE):
         confidence,
         issued_at,
         round_end,
-        website_round_id=website_round_id,
-        website_end_ms=website_end_ms,
-        website_fetched_at_ms=website_fetched_at_ms,
-        access_type="FREE" if is_free else "VIP",
-        signal_mode=signal_mode,
     )
     save_signal_to_history(signal, txn_no=txn_no, prediction_id=round_id)
     item = get_user_round(user_id, round_id) or {}
-    caption = build_round_caption(item, website_remaining)
+    img_name   = "big" if signal == "BIG" else "small"
+    caption = build_round_caption(item, ROUND_SECONDS)
     try: await q.message.delete()
     except Exception: pass
     try:
@@ -1517,7 +1319,11 @@ async def _send_signal(q, ctx: ContextTypes.DEFAULT_TYPE):
             "big" if signal == "BIG" else "small",
             caption=caption,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=round_action_keyboard(item),
+            reply_markup=(
+                kb_free_signal_actions(round_id)
+                if is_free
+                else kb_signal_actions(round_id)
+            ),
         )
         update_user_round(
             user_id,
