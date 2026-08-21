@@ -281,12 +281,17 @@ def count_free_access() -> int:
 
 # ── Channel signal storage ─────────────────────────────────────────────────────
 
-def save_channel_signal(signal: str, source_timestamp: str | None = None):
+def save_channel_signal(
+    signal: str,
+    source_timestamp: str | None = None,
+    source_transaction: str | None = None,
+):
     data = {
         "signal": signal,
         "timestamp": source_timestamp or datetime.now(timezone.utc).isoformat(),
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "source_timestamp": source_timestamp,
+        "source_transaction": source_transaction,
     }
     temp = CHANNEL_SIG_FILE.with_suffix(".tmp")
     temp.write_text(json.dumps(data))
@@ -746,7 +751,7 @@ def parse_signal_from_text(text: str) -> str | None:
         return matches[-1]
     return None
 
-def _parse_public_channel_posts(page: str) -> list[tuple[datetime, str]]:
+def _parse_public_channel_posts(page: str) -> list[tuple[datetime, str, str | None]]:
     """Extract signal text and its public post time from t.me/s HTML."""
     texts = re.findall(
         r'<div class="tgme_widget_message_text js-message_text"[^>]*>(.*?)</div>',
@@ -754,7 +759,7 @@ def _parse_public_channel_posts(page: str) -> list[tuple[datetime, str]]:
         flags=re.IGNORECASE | re.DOTALL,
     )
     times = re.findall(r'<time datetime="([^"]+)"', page, flags=re.IGNORECASE)
-    posts: list[tuple[datetime, str]] = []
+    posts: list[tuple[datetime, str, str | None]] = []
     for raw_text, raw_time in zip(texts, times):
         signal = parse_signal_from_text(raw_text)
         if not signal:
@@ -765,7 +770,11 @@ def _parse_public_channel_posts(page: str) -> list[tuple[datetime, str]]:
             continue
         if post_time.tzinfo is None:
             post_time = post_time.replace(tzinfo=timezone.utc)
-        posts.append((post_time.astimezone(timezone.utc), signal))
+        posts.append((
+            post_time.astimezone(timezone.utc),
+            signal,
+            parse_transaction_from_text(raw_text),
+        ))
     return posts
 
 async def fetch_latest_public_channel_signal() -> str | None:
@@ -782,7 +791,7 @@ async def fetch_latest_public_channel_signal() -> str | None:
         if not posts:
             logger.warning("No BIG/SMALL signal found in public channel preview")
             return None
-        post_time, source_signal = max(posts, key=lambda item: item[0])
+        post_time, source_signal, source_transaction = max(posts, key=lambda item: item[0])
         age_minutes = (datetime.now(timezone.utc) - post_time).total_seconds() / 60
         if age_minutes > CHANNEL_SIG_MAX_AGE_MIN:
             logger.warning(
@@ -790,7 +799,11 @@ async def fetch_latest_public_channel_signal() -> str | None:
                 age_minutes,
             )
             return None
-        save_channel_signal(source_signal, source_timestamp=post_time.isoformat())
+        save_channel_signal(
+            source_signal,
+            source_timestamp=post_time.isoformat(),
+            source_transaction=source_transaction,
+        )
         logger.info(
             "Public channel signal read: %s at %s",
             source_signal,
@@ -1032,12 +1045,16 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     )
     config["last_source_timestamp"] = source_timestamp
     save_channel_config(config)
-    caption = (
-        "💡 *Signal*\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 Direction : *{'🔴 BIG' if output == 'BIG' else '🔵 SMALL'}*\n"
-        f"🕐 Time      : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
-    )
+    source_data = json.loads(CHANNEL_SIG_FILE.read_text())
+    issued_at = datetime.now(timezone.utc)
+    badge, confidence = signal_quality(output)
+    caption = build_round_caption({
+        "transaction": source_data.get("source_transaction") or "—",
+        "issued_at": issued_at.isoformat(),
+        "signal": output,
+        "badge": badge,
+        "confidence": confidence,
+    })
     for chat_id, item in list(config.get("channels", {}).items()):
         if not isinstance(item, dict) or not item.get("enabled", True):
             continue
@@ -1139,7 +1156,11 @@ async def handle_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     else:
         sig = parse_signal_from_text(post_text)
         if sig:
-            save_channel_signal(sig)
+            save_channel_signal(
+                sig,
+                source_timestamp=post.date.astimezone(timezone.utc).isoformat(),
+                source_transaction=parse_transaction_from_text(post_text),
+            )
 
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
