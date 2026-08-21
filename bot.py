@@ -56,6 +56,8 @@ CHANNEL_SIG_FILE = DATA_DIR / "channel_signal.json"
 SIGNAL_HIST_FILE = DATA_DIR / "signal_history.json"
 SOURCE_HIST_FILE = DATA_DIR / "source_history.json"
 USER_ROUNDS_FILE = DATA_DIR / "user_rounds.json"
+CHANNELS_FILE    = DATA_DIR / "auto_channels.json"
+TURN_STATE_FILE  = DATA_DIR / "signal_turn.json"
 
 # The official game result endpoint is not exposed by the public web page in
 # every deployment.  When GAME_HISTORY_URL is supplied, the bot uses it for
@@ -324,6 +326,51 @@ def load_source_history() -> list:
     except Exception as e:
         logger.warning("Could not read source history: %s", e)
         return []
+
+
+def load_channel_config() -> dict:
+    """Load auto-post destinations and the last source post we published."""
+    try:
+        data = json.loads(CHANNELS_FILE.read_text()) if CHANNELS_FILE.exists() else {}
+        if not isinstance(data, dict):
+            return {"channels": {}, "auto_post": False, "last_source_timestamp": None}
+        data.setdefault("channels", {})
+        data.setdefault("auto_post", False)
+        data.setdefault("last_source_timestamp", None)
+        return data
+    except Exception as error:
+        logger.warning("Could not read auto-post configuration: %s", error)
+        return {"channels": {}, "auto_post": False, "last_source_timestamp": None}
+
+
+def save_channel_config(data: dict):
+    temp = CHANNELS_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    temp.replace(CHANNELS_FILE)
+
+
+def _next_signal_mode() -> str:
+    """Return the current mode and persist the opposite mode for next time."""
+    try:
+        state = json.loads(TURN_STATE_FILE.read_text()) if TURN_STATE_FILE.exists() else {}
+    except Exception:
+        state = {}
+    mode = state.get("next_mode", "reverse")
+    if mode not in {"reverse", "source"}:
+        mode = "reverse"
+    temp = TURN_STATE_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps({"next_mode": "source" if mode == "reverse" else "reverse"}))
+    temp.replace(TURN_STATE_FILE)
+    return mode
+
+
+def _apply_signal_mode(source_signal: str) -> str:
+    mode = _next_signal_mode()
+    return (
+        ("SMALL" if source_signal == "BIG" else "BIG")
+        if mode == "reverse"
+        else source_signal
+    )
 
 
 def load_user_rounds() -> dict:
@@ -815,17 +862,11 @@ async def generate_signal(txn_no: str) -> str | None:
     if not ch_sig:
         logger.warning("Signal unavailable because source signal is unavailable")
         return None
-    # Keep the existing reverse behavior for the first signal, then alternate
-    # between reverse and the source direction on every subsequent signal.
-    # The history file makes the turn order survive bot restarts.
-    signal_number = len(load_signal_history())
-    is_reverse_turn = signal_number % 2 == 0
-    signal = (
-        ("SMALL" if ch_sig == "BIG" else "BIG")
-        if is_reverse_turn
-        else ch_sig
-    )
-    mode = "reverse" if is_reverse_turn else "source"
+    # The turn is independent from signal history and survives restarts.
+    # This guarantees: reverse, source, reverse, source ... even when the
+    # source repeats BIG (or repeats SMALL).
+    mode = _next_signal_mode()
+    signal = ("SMALL" if ch_sig == "BIG" else "BIG") if mode == "reverse" else ch_sig
     logger.info("Public channel %s turn: %s → %s", mode, ch_sig, signal)
     return signal
 
@@ -874,6 +915,8 @@ def kb_admin():
          InlineKeyboardButton("📢 Broadcast",  callback_data="a_broadcast")],
         [InlineKeyboardButton("🎁 Grant 1h Free", callback_data="a_grant_free"),
          InlineKeyboardButton("🚫 Remove Free", callback_data="a_remove_free")],
+        [InlineKeyboardButton("➕ Add Channel", callback_data="a_add_channel"),
+         InlineKeyboardButton("📣 Auto Post", callback_data="a_auto_post")],
         [InlineKeyboardButton("🔄 Refresh",    callback_data="a_refresh")],
     ])
 
@@ -885,6 +928,14 @@ def kb_back_admin():
 def admin_panel_text() -> str:
     ch_sig    = get_channel_signal()
     ch_label  = f"✅ {ch_sig}" if ch_sig else "❌ No signal"
+    config = load_channel_config()
+    destinations = config.get("channels", {})
+    target_label = ", ".join(
+        str(item.get("title") or chat_id)
+        for chat_id, item in destinations.items()
+        if isinstance(item, dict) and item.get("enabled", True)
+    ) or "မရှိသေးပါ"
+    auto_label = "✅ ON" if config.get("auto_post") else "❌ OFF"
     now_utc   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     return (
         "🔧 *FTT Bot — Admin Panel*\n\n"
@@ -893,6 +944,8 @@ def admin_panel_text() -> str:
         f"⚠️ Expiring (≤3d)   : {count_expiring_soon()}\n"
         f"🟢 Active Sessions   : {count_active_sessions()}\n"
         f"📡 Channel Signal    : {ch_label}\n"
+        f"📣 Auto Post         : {auto_label}\n"
+        f"📍 Destinations      : {target_label}\n"
         f"🕐 Time (UTC)        : {now_utc}"
     )
 
@@ -955,6 +1008,58 @@ async def _send_text_retry(bot, chat_id: int, text: str, **kwargs):
             if attempt == 3:
                 raise
             await asyncio.sleep(attempt * 2)
+
+
+async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
+    """Poll the configured public source and publish each new source post once."""
+    config = load_channel_config()
+    if not config.get("auto_post") or not config.get("channels"):
+        return
+    source_signal = await fetch_latest_public_channel_signal()
+    if not source_signal or not CHANNEL_SIG_FILE.exists():
+        return
+    try:
+        source_timestamp = json.loads(CHANNEL_SIG_FILE.read_text()).get("timestamp")
+    except Exception:
+        return
+    if not source_timestamp or source_timestamp == config.get("last_source_timestamp"):
+        return
+    # Consume one turn only for a genuinely new source post.
+    mode = _next_signal_mode()
+    output = (
+        ("SMALL" if source_signal == "BIG" else "BIG")
+        if mode == "reverse" else source_signal
+    )
+    config["last_source_timestamp"] = source_timestamp
+    save_channel_config(config)
+    caption = (
+        "💡 *Signal*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Direction : *{'🔴 BIG' if output == 'BIG' else '🔵 SMALL'}*\n"
+        f"🕐 Time      : {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC"
+    )
+    for chat_id, item in list(config.get("channels", {}).items()):
+        if not isinstance(item, dict) or not item.get("enabled", True):
+            continue
+        try:
+            await _send_photo_retry(
+                context.bot, int(chat_id),
+                "big" if output == "BIG" else "small",
+                caption=caption, parse_mode=ParseMode.MARKDOWN,
+            )
+        except Exception as error:
+            logger.warning("Auto post failed for %s: %s", chat_id, error)
+
+
+async def auto_post_loop(app: Application):
+    while True:
+        try:
+            await auto_post_job(type("JobContext", (), {"bot": app.bot})())
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Auto-post loop error")
+        await asyncio.sleep(15)
 
 # ── Handlers ───────────────────────────────────────────────────────────────────
 
@@ -1024,6 +1129,8 @@ async def handle_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     post = update.channel_post or update.edited_channel_post
     if not post:
         return
+    if (post.chat.username or "").lower() != SIGNAL_CHANNEL.lower():
+        return
     post_text = (post.text or post.caption or "").strip()
     result_direction, actual = parse_result_from_text(post_text)
     transaction = parse_transaction_from_text(post_text)
@@ -1073,6 +1180,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _do_grant_free(update, ctx, text); return
     if state == "admin_remove_free" and user.id in ADMIN_IDS:
         await _do_remove_free(update, ctx, text); return
+    if state == "admin_add_channel" and user.id in ADMIN_IDS:
+        await _do_add_channel(update, ctx, text); return
 
     if state == "waiting_txn":
         if not has_signal_access(user.id):
@@ -1303,6 +1412,64 @@ async def _handle_admin_cb(q, ctx: ContextTypes.DEFAULT_TYPE, data: str):
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_admin(),
         )
 
+    elif data == "a_add_channel":
+        ctx.user_data["state"] = "admin_add_channel"
+        await q.edit_message_text(
+            "➕ *Add Channel / Group*\n\n"
+            "Bot ကို အဲဒီ channel/group ထဲ ထည့်ပြီး Admin ခန့်ထားပါ။\n"
+            "ပြီးရင် public `@username` သို့မဟုတ် private chat ID (`-100...`) ပေးပို့ပါ။",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_admin(),
+        )
+
+    elif data == "a_auto_post":
+        config = load_channel_config()
+        if not config.get("channels"):
+            await q.answer("အရင်ဆုံး Add Channel လုပ်ပါ။", show_alert=True)
+            return
+        config["auto_post"] = not config.get("auto_post", False)
+        save_channel_config(config)
+        await q.edit_message_text(
+            admin_panel_text(), parse_mode=ParseMode.MARKDOWN, reply_markup=kb_admin()
+        )
+
+
+async def _do_add_channel(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    ctx.user_data["state"] = None
+    target = text.strip()
+    if not target:
+        await update.message.reply_text("❌ @username သို့မဟုတ် chat ID ပေးပါ။")
+        return
+    try:
+        chat = await ctx.bot.get_chat(target)
+        me = await ctx.bot.get_me()
+        member = await ctx.bot.get_chat_member(chat.id, me.id)
+        if member.status not in {"administrator", "creator"}:
+            await update.message.reply_text(
+                "❌ Bot ကို အဲဒီ channel/group မှာ Admin ခန့်ထားပြီးမှ ပြန်စမ်းပါ။"
+            )
+            return
+        config = load_channel_config()
+        config.setdefault("channels", {})[str(chat.id)] = {
+            "title": chat.title or chat.username or str(chat.id),
+            "username": chat.username,
+            "type": chat.type,
+            "enabled": True,
+        }
+        save_channel_config(config)
+        await update.message.reply_text(
+            f"✅ *Channel Added*\n\n"
+            f"📍 {chat.title or chat.username or chat.id}\n"
+            f"📣 Auto Post: {'ON' if config.get('auto_post') else 'OFF'}",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb_admin(),
+        )
+    except Exception as error:
+        logger.warning("Could not add auto-post destination %s: %s", target, error)
+        await update.message.reply_text(
+            "❌ Channel/group ကို မတွေ့ပါ။ Bot ထည့်ပြီး Admin ခန့်ထားခြင်း၊ "
+            "ပြီးတော့ username/chat ID မှန်ကန်ခြင်းကို စစ်ပါ။"
+        )
+
 async def _do_add_vip(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
     ctx.user_data["state"] = None
     parts = text.strip().split()
@@ -1448,6 +1615,7 @@ async def post_init(app: Application):
     ])
     for admin_id in ADMIN_IDS:
         await _set_admin_commands(app.bot, admin_id)
+    app.create_task(auto_post_loop(app))
     logger.info("✅ Bot initialized")
 
 def main():
@@ -1457,12 +1625,7 @@ def main():
     app.add_handler(CommandHandler("myid",  cmd_myid))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(
-        (filters.Chat(username=SIGNAL_CHANNEL) & filters.TEXT) |
-        (filters.Chat(username=SIGNAL_CHANNEL) & filters.CAPTION) |
-        (filters.UpdateType.CHANNEL_POSTS & filters.Chat(username=SIGNAL_CHANNEL)),
-        handle_channel_post
-    ))
+    app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
     logger.info("🤖 Dr Thet Pyinn Signals Bot starting...")
