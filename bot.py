@@ -607,7 +607,13 @@ def parse_transaction_from_text(text: str) -> str | None:
         cleaned,
         flags=re.IGNORECASE,
     )
-    return match.group(1) if match else None
+    if match:
+        return match.group(1)
+    # Some source channels put the transaction number on its own line,
+    # without a "Transaction" label. Prefer a long standalone number so a
+    # date, confidence percentage, or result number is not selected.
+    standalone = re.findall(r"(?<!\d)(\d{12,})(?!\d)", cleaned)
+    return max(standalone, key=len) if standalone else None
 
 
 def parse_result_from_text(text: str) -> tuple[str | None, str | None]:
