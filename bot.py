@@ -652,7 +652,11 @@ async def fetch_game_result(txn_no: str) -> tuple[str | None, str | None]:
         async with httpx.AsyncClient(
             timeout=CHANNEL_FETCH_TIMEOUT_SECONDS,
             follow_redirects=True,
-            headers={"User-Agent": "DrThetPyinnSignalBot/2.0"},
+            headers={
+                "User-Agent": "Mozilla/5.0 DrThetPyinnSignalBot/2.0",
+                "Accept": "application/json",
+                "Referer": "https://dr-thet-pyinn-vip.lovable.app/",
+            },
         ) as client:
             response = await client.get(url, params=params)
             response.raise_for_status()
@@ -1159,7 +1163,13 @@ async def _settle_auto_pending(bot) -> None:
     """Check the last posted signal, apply M2 and post the WIN STK on a win."""
     config = load_channel_config()
     pending = config.get("auto_pending")
-    if not isinstance(pending, dict) or not pending.get("transaction"):
+    if (
+        not isinstance(pending, dict)
+        or not pending.get("transaction")
+        or str(pending.get("transaction")).strip() in {"—", "-"}
+    ):
+        if isinstance(pending, dict) and str(pending.get("transaction")).strip() in {"—", "-"}:
+            logger.warning("Auto result lookup skipped: source transaction is missing")
         return
     direction, actual = await fetch_game_result(pending["transaction"])
     if not direction:
@@ -1212,8 +1222,18 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
         if mode == "reverse" else source_signal
     )
     transaction = str(source_data.get("source_transaction") or "").strip() or "—"
+    if transaction == "—":
+        logger.warning("Auto post skipped: source transaction could not be parsed")
+        return
     amount = current_bet()
-    text = build_signal_text(transaction, output, amount)
+    badge, confidence = signal_quality(output)
+    text = build_round_caption({
+        "transaction": transaction,
+        "signal": output,
+        "badge": badge,
+        "confidence": confidence,
+        "issued_at": datetime.now(timezone.utc).isoformat(),
+    })
 
     config["last_source_timestamp"] = source_timestamp
     config["auto_pending"] = {
@@ -1226,7 +1246,13 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
 
     for chat_id, _item in targets:
         try:
-            await _send_text_retry(context.bot, int(chat_id), text)
+            await _send_photo_retry(
+                context.bot,
+                int(chat_id),
+                "big" if output == "BIG" else "small",
+                caption=text,
+                parse_mode=ParseMode.MARKDOWN,
+            )
         except Exception as error:
             logger.warning("Auto post failed for %s: %s", chat_id, error)
 
