@@ -63,7 +63,17 @@ TURN_STATE_FILE  = DATA_DIR / "signal_turn.json"
 # every deployment.  When GAME_HISTORY_URL is supplied, the bot uses it for
 # automatic WIN/LOSS settlement.  The URL may contain {txn}; otherwise the
 # transaction number is also sent as the `txn` query parameter.
-GAME_HISTORY_URL = os.getenv("GAME_HISTORY_URL", "").strip()
+GAME_HISTORY_URL = os.getenv(
+    "GAME_HISTORY_URL",
+    "https://dr-thet-pyinn-vip.lovable.app/api/public/results",
+).strip()
+
+# ── M2 Money Management ───────────────────────────────────────────────────
+# Basic amount ကို BASIC_AMOUNT env နဲ့ ပြောင်းလို့ရပါတယ် (100 / 200 ...).
+BASIC_AMOUNT = int(os.getenv("BASIC_AMOUNT", "100") or 100)
+M2_MULTIPLIERS = [1, 2, 5, 11, 25, 55, 130, 300, 650, 1400]
+MM_STATE_FILE = DATA_DIR / "mm_state.json"
+WIN_STK_FILE = DATA_DIR / "win_stickers.json"
 ROUND_SECONDS = 60
 RESULT_GRACE_SECONDS = 8
 COUNTDOWN_UPDATE_SECONDS = 1
@@ -352,6 +362,101 @@ def save_channel_config(data: dict):
     temp = CHANNELS_FILE.with_suffix(".tmp")
     temp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
     temp.replace(CHANNELS_FILE)
+
+
+def m2_ladder() -> list[int]:
+    """M2 table amounts for the configured basic amount."""
+    return [BASIC_AMOUNT * step for step in M2_MULTIPLIERS]
+
+
+def load_mm_state() -> dict:
+    """Money-management state: current M2 level and the live win streak."""
+    try:
+        data = json.loads(MM_STATE_FILE.read_text()) if MM_STATE_FILE.exists() else {}
+        if not isinstance(data, dict):
+            data = {}
+    except Exception as error:
+        logger.warning("Could not read money-management state: %s", error)
+        data = {}
+    data.setdefault("level", 0)
+    data.setdefault("win_streak", 0)
+    return data
+
+
+def save_mm_state(data: dict):
+    temp = MM_STATE_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(data, indent=2))
+    temp.replace(MM_STATE_FILE)
+
+
+def current_bet() -> int:
+    ladder = m2_ladder()
+    level = load_mm_state().get("level", 0)
+    return ladder[min(max(int(level), 0), len(ladder) - 1)]
+
+
+def mm_register_win() -> int:
+    """Win → back to the basic amount, win streak grows. Returns the streak."""
+    state = load_mm_state()
+    state["level"] = 0
+    state["win_streak"] = int(state.get("win_streak", 0)) + 1
+    save_mm_state(state)
+    return state["win_streak"]
+
+
+def mm_register_loss() -> int:
+    """Loss → next M2 level, streak resets. Returns the next level index."""
+    state = load_mm_state()
+    state["level"] = min(int(state.get("level", 0)) + 1, len(M2_MULTIPLIERS) - 1)
+    state["win_streak"] = 0
+    save_mm_state(state)
+    return state["level"]
+
+
+def load_win_stickers() -> list:
+    """Admin uploaded WIN images, in upload order (WIN 1, WIN 2, ...)."""
+    try:
+        data = json.loads(WIN_STK_FILE.read_text()) if WIN_STK_FILE.exists() else []
+        return data if isinstance(data, list) else []
+    except Exception as error:
+        logger.warning("Could not read win stickers: %s", error)
+        return []
+
+
+def save_win_stickers(items: list):
+    temp = WIN_STK_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(items, indent=2))
+    temp.replace(WIN_STK_FILE)
+
+
+def add_win_sticker(file_id: str) -> int:
+    items = load_win_stickers()
+    if file_id not in items:
+        items.append(file_id)
+        save_win_stickers(items)
+    return len(items)
+
+
+def sticker_for_streak(streak: int) -> str | None:
+    items = load_win_stickers()
+    if not items or streak < 1:
+        return None
+    return items[min(streak, len(items)) - 1]
+
+
+def enabled_channels(config: dict) -> list:
+    return [
+        (chat_id, item)
+        for chat_id, item in (config.get("channels") or {}).items()
+        if isinstance(item, dict) and item.get("enabled", True)
+    ]
+
+
+def build_signal_text(transaction: str, signal: str, amount: int) -> str:
+    """Text-only signal, e.g. `TRX 92 S 7000`."""
+    tail = re.sub(r"\D", "", str(transaction))[-2:] or str(transaction)[-2:]
+    side = "B" if signal == "BIG" else "S"
+    return f"TRX {tail} {side} {amount}"
 
 
 def _next_signal_mode() -> str:
@@ -936,8 +1041,26 @@ def kb_admin():
          InlineKeyboardButton("🚫 Remove Free", callback_data="a_remove_free")],
         [InlineKeyboardButton("➕ Add Channel", callback_data="a_add_channel"),
          InlineKeyboardButton("📣 Auto Post", callback_data="a_auto_post")],
+        [InlineKeyboardButton("🔀 Channel ON/OFF", callback_data="a_channels"),
+         InlineKeyboardButton("🖼 Add STK", callback_data="a_add_stk")],
         [InlineKeyboardButton("🔄 Refresh",    callback_data="a_refresh")],
     ])
+
+def kb_channels():
+    config = load_channel_config()
+    rows = []
+    for chat_id, item in (config.get("channels") or {}).items():
+        if not isinstance(item, dict):
+            continue
+        on = item.get("enabled", True)
+        title = str(item.get("title") or chat_id)[:22]
+        rows.append([
+            InlineKeyboardButton(f"{'🟢' if on else '🔴'} {title}", callback_data=f"a_ch_t:{chat_id}"),
+            InlineKeyboardButton("🗑", callback_data=f"a_ch_d:{chat_id}"),
+        ])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="a_refresh")])
+    return InlineKeyboardMarkup(rows)
+
 
 def kb_back_admin():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="a_refresh")]])
@@ -965,6 +1088,9 @@ def admin_panel_text() -> str:
         f"📡 Channel Signal    : {ch_label}\n"
         f"📣 Auto Post         : {auto_label}\n"
         f"📍 Destinations      : {target_label}\n"
+        f"💰 Basic / Next Bet  : {BASIC_AMOUNT} / {current_bet()}\n"
+        f"🔥 Win Streak        : {load_mm_state().get('win_streak', 0)}\n"
+        f"🖼 Win STK Saved     : {len(load_win_stickers())}\n"
         f"🕐 Time (UTC)        : {now_utc}"
     )
 
@@ -1029,47 +1155,78 @@ async def _send_text_retry(bot, chat_id: int, text: str, **kwargs):
             await asyncio.sleep(attempt * 2)
 
 
+async def _settle_auto_pending(bot) -> None:
+    """Check the last posted signal, apply M2 and post the WIN STK on a win."""
+    config = load_channel_config()
+    pending = config.get("auto_pending")
+    if not isinstance(pending, dict) or not pending.get("transaction"):
+        return
+    direction, actual = await fetch_game_result(pending["transaction"])
+    if not direction:
+        return
+    config["auto_pending"] = None
+    save_channel_config(config)
+
+    if direction == pending.get("signal"):
+        streak = mm_register_win()
+        file_id = sticker_for_streak(streak)
+        if file_id:
+            for chat_id, _item in enabled_channels(config):
+                try:
+                    await bot.send_photo(int(chat_id), photo=file_id)
+                except Exception as error:
+                    logger.warning("Could not send win STK to %s: %s", chat_id, error)
+    else:
+        # ရှုံးရင် ဘာပုံမှ မပို့ဘဲ M2 နောက်အဆင့်ကို တက်ပါတယ်။
+        mm_register_loss()
+
+
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     """Poll the configured public source and publish each new source post once."""
     config = load_channel_config()
     if not config.get("auto_post") or not config.get("channels"):
         return
+
+    await _settle_auto_pending(context.bot)
+    config = load_channel_config()
+
     source_signal = await fetch_latest_public_channel_signal()
     if not source_signal or not CHANNEL_SIG_FILE.exists():
         return
     try:
-        source_timestamp = json.loads(CHANNEL_SIG_FILE.read_text()).get("timestamp")
+        source_data = json.loads(CHANNEL_SIG_FILE.read_text())
     except Exception:
         return
+    source_timestamp = source_data.get("timestamp")
     if not source_timestamp or source_timestamp == config.get("last_source_timestamp"):
         return
+
+    targets = enabled_channels(config)
+    if not targets:
+        return
+
     # Consume one turn only for a genuinely new source post.
     mode = _next_signal_mode()
     output = (
         ("SMALL" if source_signal == "BIG" else "BIG")
         if mode == "reverse" else source_signal
     )
+    transaction = str(source_data.get("source_transaction") or "").strip() or "—"
+    amount = current_bet()
+    text = build_signal_text(transaction, output, amount)
+
     config["last_source_timestamp"] = source_timestamp
-    save_channel_config(config)
-    source_data = json.loads(CHANNEL_SIG_FILE.read_text())
-    issued_at = datetime.now(timezone.utc)
-    badge, confidence = signal_quality(output)
-    caption = build_round_caption({
-        "transaction": source_data.get("source_transaction") or "—",
-        "issued_at": issued_at.isoformat(),
+    config["auto_pending"] = {
+        "transaction": transaction,
         "signal": output,
-        "badge": badge,
-        "confidence": confidence,
-    })
-    for chat_id, item in list(config.get("channels", {}).items()):
-        if not isinstance(item, dict) or not item.get("enabled", True):
-            continue
+        "amount": amount,
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_channel_config(config)
+
+    for chat_id, _item in targets:
         try:
-            await _send_photo_retry(
-                context.bot, int(chat_id),
-                "big" if output == "BIG" else "small",
-                caption=caption, parse_mode=ParseMode.MARKDOWN,
-            )
+            await _send_text_retry(context.bot, int(chat_id), text)
         except Exception as error:
             logger.warning("Auto post failed for %s: %s", chat_id, error)
 
@@ -1209,6 +1366,16 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _do_remove_free(update, ctx, text); return
     if state == "admin_add_channel" and user.id in ADMIN_IDS:
         await _do_add_channel(update, ctx, text); return
+    if state == "admin_add_stk" and user.id in ADMIN_IDS:
+        if text.lower() == "clear":
+            save_win_stickers([])
+            await update.message.reply_text("🗑 WIN STK အားလုံး ဖျက်ပြီးပါပြီ။", reply_markup=kb_back_admin())
+        else:
+            await update.message.reply_text(
+                "🖼 WIN photo ကို ပုံအနေနဲ့ ပို့ပေးပါ (စာမဟုတ်ပါ)။",
+                reply_markup=kb_back_admin(),
+            )
+        return
 
     if state == "waiting_txn":
         if not has_signal_access(user.id):
@@ -1232,6 +1399,24 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"🎮 *Transaction no.:* `{text}`\n\n🎯 Signal ရယူရန် ခလုတ်ကိုနှိပ်ပါ:",
         parse_mode=ParseMode.MARKDOWN, reply_markup=kb_time_select(),
     )
+
+async def handle_admin_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin uploads WIN STK photos while the Add STK state is active."""
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
+        return
+    if ctx.user_data.get("state") != "admin_add_stk":
+        return
+    photos = update.message.photo
+    if not photos:
+        return
+    total = add_win_sticker(photos[-1].file_id)
+    await update.message.reply_text(
+        f"✅ WIN {total} STK သိမ်းပြီးပါပြီ။\n"
+        "နောက်ထပ်ပုံရှိရင် ဆက်ပို့ပါ၊ ပြီးရင် 🔙 Back နှိပ်ပါ။",
+        reply_markup=kb_back_admin(),
+    )
+
 
 async def _deny_non_vip(update: Update):
     try:
@@ -1448,6 +1633,47 @@ async def _handle_admin_cb(q, ctx: ContextTypes.DEFAULT_TYPE, data: str):
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_admin(),
         )
 
+    elif data == "a_channels":
+        if not load_channel_config().get("channels"):
+            await q.answer("အရင်ဆုံး Add Channel လုပ်ပါ။", show_alert=True)
+            return
+        await q.edit_message_text(
+            "🔀 *Channel ON/OFF*\n\n"
+            "🟢 = Signal ပို့မယ် / 🔴 = မပို့ဘူး\n"
+            "နာမည်ကိုနှိပ်ရင် ပြောင်းပါမယ်။ 🗑 က ဖျက်ပါမယ်။",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_channels(),
+        )
+
+    elif data.startswith("a_ch_t:"):
+        chat_id = data.split(":", 1)[1]
+        config = load_channel_config()
+        item = (config.get("channels") or {}).get(chat_id)
+        if isinstance(item, dict):
+            item["enabled"] = not item.get("enabled", True)
+            save_channel_config(config)
+            await q.answer("🟢 ON" if item["enabled"] else "🔴 OFF")
+        await q.edit_message_reply_markup(reply_markup=kb_channels())
+
+    elif data.startswith("a_ch_d:"):
+        chat_id = data.split(":", 1)[1]
+        config = load_channel_config()
+        (config.get("channels") or {}).pop(chat_id, None)
+        save_channel_config(config)
+        await q.answer("🗑 ဖျက်ပြီးပါပြီ")
+        await q.edit_message_reply_markup(reply_markup=kb_channels())
+
+    elif data == "a_add_stk":
+        ctx.user_data["state"] = "admin_add_stk"
+        await q.edit_message_text(
+            "🖼 *Add WIN STK*\n\n"
+            f"လက်ရှိ သိမ်းထားတဲ့ STK : *{len(load_win_stickers())}* ခု\n\n"
+            "WIN photo တွေကို တစ်ခုပြီးတစ်ခု ပို့ပေးပါ။\n"
+            "ပို့တဲ့အစီအစဉ်အတိုင်း WIN 1, WIN 2, WIN 3 ... ဖြစ်ပါမယ်။\n"
+            "အကုန်ပြီးရင် 🔙 Back နှိပ်ပါ။\n\n"
+            "အားလုံးဖျက်ချင်ရင် `clear` လို့ ရိုက်ပါ။",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_admin(),
+        )
+
     elif data == "a_auto_post":
         config = load_channel_config()
         if not config.get("channels"):
@@ -1653,6 +1879,7 @@ def main():
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
+    app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_admin_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
     logger.info("🤖 Dr Thet Pyinn Signals Bot starting...")
