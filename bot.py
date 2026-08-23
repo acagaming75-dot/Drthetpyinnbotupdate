@@ -65,7 +65,7 @@ TURN_STATE_FILE  = DATA_DIR / "signal_turn.json"
 # transaction number is also sent as the `txn` query parameter.
 GAME_HISTORY_URL = os.getenv(
     "GAME_HISTORY_URL",
-    "https://dr-thet-pyinn-vip.lovable.app/api/public/results",
+    "https://real-time-lottery-vision.lovable.app/api/public/results",
 ).strip()
 
 # ── M2 Money Management ───────────────────────────────────────────────────
