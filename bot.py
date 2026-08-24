@@ -71,7 +71,7 @@ GAME_HISTORY_URL = os.getenv(
 # ── M2 Money Management ───────────────────────────────────────────────────
 # Basic amount ကို BASIC_AMOUNT env နဲ့ ပြောင်းလို့ရပါတယ် (100 / 200 ...).
 BASIC_AMOUNT = int(os.getenv("BASIC_AMOUNT", "100") or 100)
-M2_MULTIPLIERS = [1, 2, 5, 11, 25, 55, 130, 300, 650, 1400]
+M2_MULTIPLIERS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 MM_STATE_FILE = DATA_DIR / "mm_state.json"
 WIN_STK_FILE = DATA_DIR / "win_stickers.json"
 ROUND_SECONDS = 60
@@ -626,7 +626,10 @@ def _result_for_transaction(payload, txn_no: str) -> tuple[str | None, str | Non
         )
         if txn not in identifiers:
             continue
-        for key in ("result", "number", "num", "openNumber", "winningNumber", "value", "code"):
+        for key in (
+            "result", "number", "num", "openNumber", "winningNumber",
+            "value", "code", "actual", "actualNumber", "resultNumber",
+        ):
             if key in item:
                 direction, actual = result_from_value(item[key])
                 if direction:
@@ -647,12 +650,18 @@ async def fetch_game_result(txn_no: str) -> tuple[str | None, str | None]:
         "transactionNo": txn_no,
         "period": txn_no,
         "issue": txn_no,
+        "issueNumber": txn_no,
     }
     try:
         async with httpx.AsyncClient(
             timeout=CHANNEL_FETCH_TIMEOUT_SECONDS,
             follow_redirects=True,
-            headers={"User-Agent": "DrThetPyinnSignalBot/2.0"},
+            headers={
+                "User-Agent": "Mozilla/5.0 DrThetPyinnSignalBot/2.0",
+                "Accept": "application/json",
+                "Referer": "https://dr-thet-pyinn-vip.lovable.app/",
+                "X-Requested-With": "XMLHttpRequest",
+            },
         ) as client:
             response = await client.get(url, params=params)
             response.raise_for_status()
@@ -733,33 +742,6 @@ def parse_result_from_text(text: str) -> tuple[str | None, str | None]:
     return result_from_value(match.group(1)) if match else (None, None)
 
 
-async def _apply_pending_result(bot, config: dict, direction: str) -> None:
-    """Apply M2 money-management + WIN STK to the bot's own posted auto signal.
-
-    WIN  -> mm_register_win()  resets the M2 level back to the basic amount (1x)
-             and posts the next WIN STK image for the current win streak.
-    LOSS -> mm_register_loss() advances one M2 level (bigger next stake, e.g. 2x)
-             and posts nothing.
-    """
-    pending = config.get("auto_pending")
-    if not isinstance(pending, dict) or not pending.get("transaction"):
-        return
-    config["auto_pending"] = None
-    save_channel_config(config)
-
-    if direction == pending.get("signal"):
-        streak = mm_register_win()
-        file_id = sticker_for_streak(streak)
-        if file_id:
-            for chat_id, _item in enabled_channels(config):
-                try:
-                    await bot.send_photo(int(chat_id), photo=file_id)
-                except Exception as error:
-                    logger.warning("Could not send win STK to %s: %s", chat_id, error)
-    else:
-        mm_register_loss()
-
-
 async def settle_channel_result(bot, transaction: str, direction: str, actual: str | None):
     """Settle every user's open prediction for an explicitly labelled result post."""
     for user_id, rounds in load_user_rounds().items():
@@ -790,19 +772,6 @@ async def settle_channel_result(bot, transaction: str, direction: str, actual: s
                         )
                     except Exception as error:
                         logger.warning("Could not show channel-settled result: %s", error)
-
-    # This is the path that actually fires reliably (the source channel's own
-    # "RESULT:" post). The bot's own auto-posted signal + M2 stake must be
-    # settled here too - previously only the fragile GAME_HISTORY_URL lookup
-    # in _settle_auto_pending() did this, so if that endpoint never responded,
-    # the M2 stake never advanced and the WIN STK photo was never sent.
-    config = load_channel_config()
-    pending = config.get("auto_pending")
-    if (
-        isinstance(pending, dict)
-        and str(pending.get("transaction", "")).strip() == str(transaction).strip()
-    ):
-        await _apply_pending_result(bot, config, direction)
 
 
 def build_round_caption(item: dict, remaining: int | None = None) -> str:
@@ -1196,12 +1165,7 @@ async def _send_text_retry(bot, chat_id: int, text: str, **kwargs):
 
 
 async def _settle_auto_pending(bot) -> None:
-    """Fallback settlement via GAME_HISTORY_URL, if that endpoint is configured
-    and working. The primary, reliable settlement now happens as soon as the
-    source channel posts its own "RESULT:" message - see settle_channel_result()
-    / _apply_pending_result(). This just avoids leaving a stake stuck open if
-    the channel never posts an explicit result for some round.
-    """
+    """Check the last posted signal, apply M2 and post the WIN STK on a win."""
     config = load_channel_config()
     pending = config.get("auto_pending")
     if not isinstance(pending, dict) or not pending.get("transaction"):
@@ -1209,7 +1173,21 @@ async def _settle_auto_pending(bot) -> None:
     direction, actual = await fetch_game_result(pending["transaction"])
     if not direction:
         return
-    await _apply_pending_result(bot, config, direction)
+    config["auto_pending"] = None
+    save_channel_config(config)
+
+    if direction == pending.get("signal"):
+        streak = mm_register_win()
+        file_id = sticker_for_streak(streak)
+        if file_id:
+            for chat_id, _item in enabled_channels(config):
+                try:
+                    await bot.send_photo(int(chat_id), photo=file_id)
+                except Exception as error:
+                    logger.warning("Could not send win STK to %s: %s", chat_id, error)
+    else:
+        # ရှုံးရင် ဘာပုံမှ မပို့ဘဲ M2 နောက်အဆင့်ကို တက်ပါတယ်။
+        mm_register_loss()
 
 
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
