@@ -67,6 +67,7 @@ GAME_HISTORY_URL = os.getenv(
     "GAME_HISTORY_URL",
     "https://real-time-lottery-vision.lovable.app/api/public/results",
 ).strip()
+GAME_HISTORY_FALLBACK_URL = "https://dr-thet-pyinn-vip.lovable.app/api/public/results"
 
 # ── M2 Money Management ───────────────────────────────────────────────────
 # Basic amount ကို BASIC_AMOUNT env နဲ့ ပြောင်းလို့ရပါတယ် (100 / 200 ...).
@@ -641,17 +642,9 @@ def _result_for_transaction(payload, txn_no: str) -> tuple[str | None, str | Non
 
 
 async def fetch_game_result(txn_no: str) -> tuple[str | None, str | None]:
-    """Best-effort result lookup; unavailable endpoints never create a result."""
+    """Read the game result with retries and a backup Loveable endpoint."""
     if not GAME_HISTORY_URL:
         return None, None
-    url = GAME_HISTORY_URL.replace("{txn}", quote(str(txn_no), safe=""))
-    params = {} if "{txn}" in GAME_HISTORY_URL else {
-        "txn": txn_no,
-        "transactionNo": txn_no,
-        "period": txn_no,
-        "issue": txn_no,
-        "issueNumber": txn_no,
-    }
     try:
         async with httpx.AsyncClient(
             timeout=CHANNEL_FETCH_TIMEOUT_SECONDS,
@@ -663,13 +656,43 @@ async def fetch_game_result(txn_no: str) -> tuple[str | None, str | None]:
                 "X-Requested-With": "XMLHttpRequest",
             },
         ) as client:
-            response = await client.get(url, params=params)
-            response.raise_for_status()
-            try:
-                payload = response.json()
-            except ValueError:
-                payload = response.text
-        return _result_for_transaction(payload, txn_no)
+            endpoints = [GAME_HISTORY_URL]
+            if GAME_HISTORY_FALLBACK_URL not in endpoints:
+                endpoints.append(GAME_HISTORY_FALLBACK_URL)
+            for endpoint in endpoints:
+                url = endpoint.replace("{txn}", quote(str(txn_no), safe=""))
+                params = {} if "{txn}" in endpoint else {
+                    "txn": txn_no,
+                    "transactionNo": txn_no,
+                    "period": txn_no,
+                    "issue": txn_no,
+                    "issueNumber": txn_no,
+                }
+                for attempt in range(1, 4):
+                    response = await client.get(url, params=params)
+                    if response.status_code in {502, 503, 504}:
+                        logger.warning(
+                            "Result API returned HTTP %s for %s (attempt %s/3)",
+                            response.status_code, endpoint, attempt,
+                        )
+                        if attempt < 3:
+                            await asyncio.sleep(attempt * 2)
+                            continue
+                        break
+                    response.raise_for_status()
+                    try:
+                        payload = response.json()
+                    except ValueError:
+                        payload = response.text
+                    direction, actual = _result_for_transaction(payload, txn_no)
+                    if direction:
+                        return direction, actual
+                    logger.warning(
+                        "Transaction %s not found in result response from %s",
+                        txn_no, endpoint,
+                    )
+                    break
+        return None, None
     except (httpx.HTTPError, OSError) as error:
         logger.warning("Could not read game result for %s: %s", txn_no, error)
         return None, None
