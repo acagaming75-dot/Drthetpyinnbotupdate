@@ -1321,18 +1321,15 @@ async def handle_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if (post.chat.username or "").lower() != SIGNAL_CHANNEL.lower():
         return
     post_text = (post.text or post.caption or "").strip()
-    result_direction, actual = parse_result_from_text(post_text)
-    transaction = parse_transaction_from_text(post_text)
-    if result_direction and transaction:
-        await settle_channel_result(ctx.bot, transaction, result_direction, actual)
-    else:
-        sig = parse_signal_from_text(post_text)
-        if sig:
-            save_channel_signal(
-                sig,
-                source_timestamp=post.date.astimezone(timezone.utc).isoformat(),
-                source_transaction=parse_transaction_from_text(post_text),
-            )
+    # The source channel is used only for the signal. WIN/LOSS is determined
+    # exclusively by the Loveable website result API.
+    sig = parse_signal_from_text(post_text)
+    if sig:
+        save_channel_signal(
+            sig,
+            source_timestamp=post.date.astimezone(timezone.utc).isoformat(),
+            source_transaction=parse_transaction_from_text(post_text),
+        )
 
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
