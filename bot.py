@@ -1197,7 +1197,7 @@ async def _settle_auto_pending(bot, config: dict, channel_level: int | None) -> 
         if file_id:
             for chat_id, _item in enabled_channels(config):
                 try:
-                    await bot.send_photo(int(chat_id), photo=file_id)
+                    await bot.send_sticker(int(chat_id), sticker=file_id)
                 except Exception as error:
                     logger.warning("Could not send win STK to %s: %s", chat_id, error)
     else:
@@ -1404,8 +1404,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             save_win_stickers([])
             await update.message.reply_text("🗑 WIN STK အားလုံး ဖျက်ပြီးပါပြီ။", reply_markup=kb_back_admin())
         else:
+            next_no = len(load_win_stickers()) + 1
             await update.message.reply_text(
-                "🖼 WIN photo ကို ပုံအနေနဲ့ ပို့ပေးပါ (စာမဟုတ်ပါ)။",
+                f"🖼 WIN {next_no} ← Sticker ကို sticker အနေနဲ့ ပို့ပေးပါ (စာ/ပုံ မဟုတ်ပါ)။",
                 reply_markup=kb_back_admin(),
             )
         return
@@ -1434,19 +1435,34 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_admin_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Admin uploads WIN STK photos while the Add STK state is active."""
+    """Admin accidentally sends a photo (not a sticker) while Add STK is active."""
     user = update.effective_user
     if not user or user.id not in ADMIN_IDS:
         return
     if ctx.user_data.get("state") != "admin_add_stk":
         return
-    photos = update.message.photo
-    if not photos:
+    next_no = len(load_win_stickers()) + 1
+    await update.message.reply_text(
+        f"⚠️ ပုံ (photo) မဟုတ်ပဲ WIN {next_no} အတွက် Sticker ကိုသာ sticker အနေနဲ့ ပို့ပေးပါ။",
+        reply_markup=kb_back_admin(),
+    )
+
+
+async def handle_admin_sticker(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin uploads WIN STK stickers while the Add STK state is active."""
+    user = update.effective_user
+    if not user or user.id not in ADMIN_IDS:
         return
-    total = add_win_sticker(photos[-1].file_id)
+    if ctx.user_data.get("state") != "admin_add_stk":
+        return
+    sticker = update.message.sticker
+    if not sticker:
+        return
+    total = add_win_sticker(sticker.file_id)
+    next_no = total + 1
     await update.message.reply_text(
         f"✅ WIN {total} STK သိမ်းပြီးပါပြီ။\n"
-        "နောက်ထပ်ပုံရှိရင် ဆက်ပို့ပါ၊ ပြီးရင် 🔙 Back နှိပ်ပါ။",
+        f"➡️ WIN {next_no} ← Sticker ကို ဆက်ပို့ပါ၊ ပြီးရင် 🔙 Back နှိပ်ပါ။",
         reply_markup=kb_back_admin(),
     )
 
@@ -1697,12 +1713,14 @@ async def _handle_admin_cb(q, ctx: ContextTypes.DEFAULT_TYPE, data: str):
 
     elif data == "a_add_stk":
         ctx.user_data["state"] = "admin_add_stk"
+        next_no = len(load_win_stickers()) + 1
         await q.edit_message_text(
             "🖼 *Add WIN STK*\n\n"
             f"လက်ရှိ သိမ်းထားတဲ့ STK : *{len(load_win_stickers())}* ခု\n\n"
-            "WIN photo တွေကို တစ်ခုပြီးတစ်ခု ပို့ပေးပါ။\n"
-            "ပို့တဲ့အစီအစဉ်အတိုင်း WIN 1, WIN 2, WIN 3 ... ဖြစ်ပါမယ်။\n"
-            "အကုန်ပြီးရင် 🔙 Back နှိပ်ပါ။\n\n"
+            "Sticker တွေကို တစ်ခုပြီးတစ်ခု *sticker အနေနဲ့* ပို့ပေးပါ (ပုံ/photo မဟုတ်ပါ)။\n"
+            "ပို့တဲ့အစီအစဉ်အတိုင်း WIN 1, WIN 2, WIN 3, WIN 4, WIN 5 ... ဖြစ်ပါမယ်။\n\n"
+            f"➡️ *WIN {next_no}* ← Sticker ကို အရင်ပို့ပါ။\n\n"
+            "အကုန်ပြီးရင် 🔙 Back နှိပ်ပါ။\n"
             "အားလုံးဖျက်ချင်ရင် `clear` လို့ ရိုက်ပါ။",
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_admin(),
         )
@@ -1913,6 +1931,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.UpdateType.CHANNEL_POSTS, handle_channel_post))
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, handle_admin_photo))
+    app.add_handler(MessageHandler(filters.Sticker.ALL & filters.ChatType.PRIVATE, handle_admin_sticker))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
     logger.info("🤖 Dr Thet Pyinn Signals Bot starting...")
