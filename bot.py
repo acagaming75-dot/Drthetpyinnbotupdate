@@ -59,16 +59,6 @@ USER_ROUNDS_FILE = DATA_DIR / "user_rounds.json"
 CHANNELS_FILE    = DATA_DIR / "auto_channels.json"
 TURN_STATE_FILE  = DATA_DIR / "signal_turn.json"
 
-# The official game result endpoint is not exposed by the public web page in
-# every deployment.  When GAME_HISTORY_URL is supplied, the bot uses it for
-# automatic WIN/LOSS settlement.  The URL may contain {txn}; otherwise the
-# transaction number is also sent as the `txn` query parameter.
-GAME_HISTORY_URL = os.getenv(
-    "GAME_HISTORY_URL",
-    "https://real-time-lottery-vision.lovable.app/api/public/results",
-).strip()
-GAME_HISTORY_FALLBACK_URL = "https://dr-thet-pyinn-vip.lovable.app/api/public/results"
-
 # ── M2 Money Management ───────────────────────────────────────────────────
 # Basic amount ကို BASIC_AMOUNT env နဲ့ ပြောင်းလို့ရပါတယ် (100 / 200 ...).
 BASIC_AMOUNT = int(os.getenv("BASIC_AMOUNT", "100") or 100)
@@ -641,63 +631,6 @@ def _result_for_transaction(payload, txn_no: str) -> tuple[str | None, str | Non
     return None, None
 
 
-async def fetch_game_result(txn_no: str) -> tuple[str | None, str | None]:
-    """Read the game result with retries and a backup Loveable endpoint."""
-    if not GAME_HISTORY_URL:
-        return None, None
-    try:
-        async with httpx.AsyncClient(
-            timeout=CHANNEL_FETCH_TIMEOUT_SECONDS,
-            follow_redirects=True,
-            headers={
-                "User-Agent": "Mozilla/5.0 DrThetPyinnSignalBot/2.0",
-                "Accept": "application/json",
-                "Referer": "https://dr-thet-pyinn-vip.lovable.app/",
-                "X-Requested-With": "XMLHttpRequest",
-            },
-        ) as client:
-            endpoints = [GAME_HISTORY_URL]
-            if GAME_HISTORY_FALLBACK_URL not in endpoints:
-                endpoints.append(GAME_HISTORY_FALLBACK_URL)
-            for endpoint in endpoints:
-                url = endpoint.replace("{txn}", quote(str(txn_no), safe=""))
-                params = {} if "{txn}" in endpoint else {
-                    "txn": txn_no,
-                    "transactionNo": txn_no,
-                    "period": txn_no,
-                    "issue": txn_no,
-                    "issueNumber": txn_no,
-                }
-                for attempt in range(1, 4):
-                    response = await client.get(url, params=params)
-                    if response.status_code in {502, 503, 504}:
-                        logger.warning(
-                            "Result API returned HTTP %s for %s (attempt %s/3)",
-                            response.status_code, endpoint, attempt,
-                        )
-                        if attempt < 3:
-                            await asyncio.sleep(attempt * 2)
-                            continue
-                        break
-                    response.raise_for_status()
-                    try:
-                        payload = response.json()
-                    except ValueError:
-                        payload = response.text
-                    direction, actual = _result_for_transaction(payload, txn_no)
-                    if direction:
-                        return direction, actual
-                    logger.warning(
-                        "Transaction %s not found in result response from %s",
-                        txn_no, endpoint,
-                    )
-                    break
-        return None, None
-    except (httpx.HTTPError, OSError) as error:
-        logger.warning("Could not read game result for %s: %s", txn_no, error)
-        return None, None
-
-
 def signal_quality(signal: str) -> tuple[str, int]:
     """Give a transparent confidence label from available history only."""
     source = [x.get("signal") for x in load_source_history()[-12:] if x.get("signal") in {"BIG", "SMALL"}]
@@ -765,6 +698,15 @@ def parse_result_from_text(text: str) -> tuple[str | None, str | None]:
     return result_from_value(match.group(1)) if match else (None, None)
 
 
+def parse_channel_result_from_text(text: str) -> tuple[str | None, str | None]:
+    """Parse source-channel results such as `SMALL (2)` or `BIG (3)`."""
+    cleaned = unescape(re.sub(r"<[^>]+>", " ", text or "")).upper()
+    match = re.search(r"\b(BIG|SMALL)\s*\(\s*([0-9])\s*\)", cleaned)
+    if not match:
+        return None, None
+    return match.group(1), match.group(2)
+
+
 async def settle_channel_result(bot, transaction: str, direction: str, actual: str | None):
     """Settle every user's open prediction for an explicitly labelled result post."""
     for user_id, rounds in load_user_rounds().items():
@@ -823,34 +765,9 @@ async def settle_round_now(
     item = get_user_round(user_id, round_id)
     if not item or item.get("result") in {"WIN", "LOSS"}:
         return item
-    direction, actual = await fetch_game_result(item.get("transaction", ""))
-    if not direction:
-        return item
-    result = "WIN" if direction == item.get("signal") else "LOSS"
-    updated = update_user_round(
-        user_id,
-        round_id,
-        status=result,
-        result=result,
-        actual=actual or direction,
-        settled_at=datetime.now(timezone.utc).isoformat(),
-        settled_by="game_history",
-    )
-    settle_signal_history(round_id, result, actual or direction)
-    if updated:
-        message_id = updated.get("message_id")
-        if message_id:
-            try:
-                await bot.edit_message_caption(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    caption=build_round_caption(updated),
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=kb_signal_actions(round_id),
-                )
-            except Exception as error:
-                logger.warning("Could not update settled signal message: %s", error)
-    return updated
+    # Results are settled only when the matching result post arrives from the
+    # configured Telegram source channel. Never guess a result from a timer.
+    return item
 
 
 async def track_round(bot, user_id: int, round_id: str, chat_id: int):
@@ -904,6 +821,8 @@ def _parse_public_channel_posts(page: str) -> list[tuple[datetime, str, str | No
     times = re.findall(r'<time datetime="([^"]+)"', page, flags=re.IGNORECASE)
     posts: list[tuple[datetime, str, str | None]] = []
     for raw_text, raw_time in zip(texts, times):
+        if parse_channel_result_from_text(raw_text)[0]:
+            continue
         signal = parse_signal_from_text(raw_text)
         if not signal:
             continue
@@ -1187,14 +1106,16 @@ async def _send_text_retry(bot, chat_id: int, text: str, **kwargs):
             await asyncio.sleep(attempt * 2)
 
 
-async def _settle_auto_pending(bot) -> None:
-    """Check the last posted signal, apply M2 and post the WIN STK on a win."""
+async def _settle_auto_pending_from_channel(
+    bot, transaction: str, direction: str, actual: str | None,
+) -> None:
+    """Settle Auto Post only from the matching Telegram result post."""
     config = load_channel_config()
     pending = config.get("auto_pending")
-    if not isinstance(pending, dict) or not pending.get("transaction"):
-        return
-    direction, actual = await fetch_game_result(pending["transaction"])
-    if not direction:
+    if (
+        not isinstance(pending, dict)
+        or str(pending.get("transaction", "")).strip() != str(transaction).strip()
+    ):
         return
     config["auto_pending"] = None
     save_channel_config(config)
@@ -1209,7 +1130,7 @@ async def _settle_auto_pending(bot) -> None:
                 except Exception as error:
                     logger.warning("Could not send win STK to %s: %s", chat_id, error)
     else:
-        # ရှုံးရင် ဘာပုံမှ မပို့ဘဲ M2 နောက်အဆင့်ကို တက်ပါတယ်။
+        # LOSS: no sticker; advance to the next M2 level.
         mm_register_loss()
 
 
@@ -1219,7 +1140,6 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     if not config.get("auto_post") or not config.get("channels"):
         return
 
-    await _settle_auto_pending(context.bot)
     config = load_channel_config()
 
     source_signal = await fetch_latest_public_channel_signal()
@@ -1344,14 +1264,28 @@ async def handle_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if (post.chat.username or "").lower() != SIGNAL_CHANNEL.lower():
         return
     post_text = (post.text or post.caption or "").strip()
-    # The source channel is used only for the signal. WIN/LOSS is determined
-    # exclusively by the Loveable website result API.
+    transaction = parse_transaction_from_text(post_text)
+    result_direction, actual = parse_channel_result_from_text(post_text)
+    if transaction and result_direction:
+        logger.info(
+            "Telegram result received: transaction=%s result=%s number=%s",
+            transaction, result_direction, actual or "—",
+        )
+        await settle_channel_result(
+            ctx.bot, transaction, result_direction, actual,
+        )
+        await _settle_auto_pending_from_channel(
+            ctx.bot, transaction, result_direction, actual,
+        )
+        return
+    # Signal posts provide source signals only. Result posts never become
+    # signals and are settled above by transaction number.
     sig = parse_signal_from_text(post_text)
     if sig:
         save_channel_signal(
             sig,
             source_timestamp=post.date.astimezone(timezone.utc).isoformat(),
-            source_transaction=parse_transaction_from_text(post_text),
+            source_transaction=transaction,
         )
 
 
