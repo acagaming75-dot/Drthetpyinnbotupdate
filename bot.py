@@ -406,28 +406,13 @@ def mm_register_win() -> int:
     return state["win_streak"]
 
 
-def mm_register_loss(channel_level: int | None = None) -> int:
-    """Loss → next M2 level, streak resets. Returns the next level index.
-    When the source channel tells us its own ladder level (1-indexed), we
-    sync to that directly instead of just +1, so a missed post never lets
-    our bet size drift away from what the channel is actually on."""
+def mm_register_loss() -> int:
+    """Loss → next M2 level, streak resets. Returns the next level index."""
     state = load_mm_state()
-    if channel_level:
-        state["level"] = min(max(int(channel_level) - 1, 0), len(M2_MULTIPLIERS) - 1)
-    else:
-        state["level"] = min(int(state.get("level", 0)) + 1, len(M2_MULTIPLIERS) - 1)
+    state["level"] = min(int(state.get("level", 0)) + 1, len(M2_MULTIPLIERS) - 1)
     state["win_streak"] = 0
     save_mm_state(state)
     return state["level"]
-
-
-def mm_sync_level(channel_level: int) -> None:
-    """Align our bet level to the channel's posted level without touching
-    the win streak — used when there is no pending signal to settle yet
-    (e.g. right after the bot starts)."""
-    state = load_mm_state()
-    state["level"] = min(max(int(channel_level) - 1, 0), len(M2_MULTIPLIERS) - 1)
-    save_mm_state(state)
 
 
 def load_win_stickers() -> list:
@@ -1190,10 +1175,11 @@ async def _send_text_retry(bot, chat_id: int, text: str, **kwargs):
 
 
 async def _settle_auto_pending(bot, config: dict, channel_level: int | None) -> bool:
-    """Use the NEW post's own (N) ladder label to settle the PREVIOUS post:
-    (1) means the previous signal WON (ladder reset), any higher number
-    means it LOST (ladder moved up). No website call needed — the source
-    channel already tells us the outcome via its own numbering.
+    """Use the NEW post's own (N) ladder label to read the SOURCE channel's
+    outcome: (1) means the source's previous signal WON, any higher number
+    means it LOST. But our bot may have posted the OPPOSITE of the source
+    that round (reverse mode) — so our own win/loss is the source's outcome
+    flipped whenever our pending signal was posted in "reverse" mode.
     Returns True if a pending signal was actually settled."""
     pending = config.get("auto_pending")
     if not isinstance(pending, dict) or not pending.get("transaction") or not channel_level:
@@ -1202,7 +1188,10 @@ async def _settle_auto_pending(bot, config: dict, channel_level: int | None) -> 
     config["auto_pending"] = None
     save_channel_config(config)
 
-    if channel_level == 1:
+    source_won = channel_level == 1
+    our_won = source_won if pending.get("mode", "source") == "source" else (not source_won)
+
+    if our_won:
         streak = mm_register_win()
         file_id = sticker_for_streak(streak)
         if file_id:
@@ -1212,8 +1201,8 @@ async def _settle_auto_pending(bot, config: dict, channel_level: int | None) -> 
                 except Exception as error:
                     logger.warning("Could not send win STK to %s: %s", chat_id, error)
     else:
-        # ရှုံးရင် ဘာပုံမှ မပို့ဘဲ M2 ကို channel ရဲ့ (N) အတိုင်း sync လုပ်ပါတယ်။
-        mm_register_loss(channel_level)
+        # ရှုံးရင် ဘာပုံမှ မပို့ဘဲ M2 နောက်အဆင့်ကို တက်ပါတယ်။
+        mm_register_loss()
     return True
 
 
@@ -1239,17 +1228,14 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     channel_level = source_data.get("source_level")
+    if not channel_level:
+        logger.warning("Channel post had no (N) level tag; win/loss for the pending signal will be checked next time")
 
-    # Settle the previous pending signal using THIS post's (N) label, then
-    # size this new signal's bet the same way — self-syncing every turn.
-    settled = await _settle_auto_pending(context.bot, config, channel_level)
+    # Settle the previous pending signal using THIS post's (N) label —
+    # accounting for whichever mode (source/reverse) that pending signal
+    # was actually posted in.
+    await _settle_auto_pending(context.bot, config, channel_level)
     config = load_channel_config()
-    if channel_level and not settled:
-        # First post since startup (nothing pending yet) — just sync our
-        # bet level to what the channel is already showing.
-        mm_sync_level(channel_level)
-    elif not channel_level:
-        logger.warning("Channel post had no (N) level tag; using last known M2 level")
 
     # Consume one turn only for a genuinely new source post.
     mode = _next_signal_mode()
@@ -1265,7 +1251,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     config["auto_pending"] = {
         "transaction": transaction,
         "signal": output,
-        "level": channel_level,
+        "mode": mode,
         "amount": amount,
         "sent_at": datetime.now(timezone.utc).isoformat(),
     }
