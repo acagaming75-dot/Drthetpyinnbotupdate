@@ -59,10 +59,19 @@ USER_ROUNDS_FILE = DATA_DIR / "user_rounds.json"
 CHANNELS_FILE    = DATA_DIR / "auto_channels.json"
 TURN_STATE_FILE  = DATA_DIR / "signal_turn.json"
 
+# The official game result endpoint is not exposed by the public web page in
+# every deployment.  When GAME_HISTORY_URL is supplied, the bot uses it for
+# automatic WIN/LOSS settlement.  The URL may contain {txn}; otherwise the
+# transaction number is also sent as the `txn` query parameter.
+GAME_HISTORY_URL = os.getenv(
+    "GAME_HISTORY_URL",
+    "https://real-time-lottery-vision.lovable.app/api/public/results",
+).strip()
+
 # ── M2 Money Management ───────────────────────────────────────────────────
 # Basic amount ကို BASIC_AMOUNT env နဲ့ ပြောင်းလို့ရပါတယ် (100 / 200 ...).
 BASIC_AMOUNT = int(os.getenv("BASIC_AMOUNT", "100") or 100)
-M2_MULTIPLIERS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+M2_MULTIPLIERS = [1, 2, 5, 11, 25, 55, 130, 300, 650, 1400]
 MM_STATE_FILE = DATA_DIR / "mm_state.json"
 WIN_STK_FILE = DATA_DIR / "win_stickers.json"
 ROUND_SECONDS = 60
@@ -286,6 +295,7 @@ def save_channel_signal(
     signal: str,
     source_timestamp: str | None = None,
     source_transaction: str | None = None,
+    source_level: int | None = None,
 ):
     data = {
         "signal": signal,
@@ -293,6 +303,7 @@ def save_channel_signal(
         "fetched_at": datetime.now(timezone.utc).isoformat(),
         "source_timestamp": source_timestamp,
         "source_transaction": source_transaction,
+        "source_level": source_level,
     }
     temp = CHANNEL_SIG_FILE.with_suffix(".tmp")
     temp.write_text(json.dumps(data))
@@ -395,13 +406,28 @@ def mm_register_win() -> int:
     return state["win_streak"]
 
 
-def mm_register_loss() -> int:
-    """Loss → next M2 level, streak resets. Returns the next level index."""
+def mm_register_loss(channel_level: int | None = None) -> int:
+    """Loss → next M2 level, streak resets. Returns the next level index.
+    When the source channel tells us its own ladder level (1-indexed), we
+    sync to that directly instead of just +1, so a missed post never lets
+    our bet size drift away from what the channel is actually on."""
     state = load_mm_state()
-    state["level"] = min(int(state.get("level", 0)) + 1, len(M2_MULTIPLIERS) - 1)
+    if channel_level:
+        state["level"] = min(max(int(channel_level) - 1, 0), len(M2_MULTIPLIERS) - 1)
+    else:
+        state["level"] = min(int(state.get("level", 0)) + 1, len(M2_MULTIPLIERS) - 1)
     state["win_streak"] = 0
     save_mm_state(state)
     return state["level"]
+
+
+def mm_sync_level(channel_level: int) -> None:
+    """Align our bet level to the channel's posted level without touching
+    the win streak — used when there is no pending signal to settle yet
+    (e.g. right after the bot starts)."""
+    state = load_mm_state()
+    state["level"] = min(max(int(channel_level) - 1, 0), len(M2_MULTIPLIERS) - 1)
+    save_mm_state(state)
 
 
 def load_win_stickers() -> list:
@@ -617,10 +643,7 @@ def _result_for_transaction(payload, txn_no: str) -> tuple[str | None, str | Non
         )
         if txn not in identifiers:
             continue
-        for key in (
-            "result", "number", "num", "openNumber", "winningNumber",
-            "value", "code", "actual", "actualNumber", "resultNumber",
-        ):
+        for key in ("result", "number", "num", "openNumber", "winningNumber", "value", "code"):
             if key in item:
                 direction, actual = result_from_value(item[key])
                 if direction:
@@ -629,6 +652,35 @@ def _result_for_transaction(payload, txn_no: str) -> tuple[str | None, str | Non
         if direction:
             return direction, actual
     return None, None
+
+
+async def fetch_game_result(txn_no: str) -> tuple[str | None, str | None]:
+    """Best-effort result lookup; unavailable endpoints never create a result."""
+    if not GAME_HISTORY_URL:
+        return None, None
+    url = GAME_HISTORY_URL.replace("{txn}", quote(str(txn_no), safe=""))
+    params = {} if "{txn}" in GAME_HISTORY_URL else {
+        "txn": txn_no,
+        "transactionNo": txn_no,
+        "period": txn_no,
+        "issue": txn_no,
+    }
+    try:
+        async with httpx.AsyncClient(
+            timeout=CHANNEL_FETCH_TIMEOUT_SECONDS,
+            follow_redirects=True,
+            headers={"User-Agent": "DrThetPyinnSignalBot/2.0"},
+        ) as client:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = response.text
+        return _result_for_transaction(payload, txn_no)
+    except (httpx.HTTPError, OSError) as error:
+        logger.warning("Could not read game result for %s: %s", txn_no, error)
+        return None, None
 
 
 def signal_quality(signal: str) -> tuple[str, int]:
@@ -698,15 +750,6 @@ def parse_result_from_text(text: str) -> tuple[str | None, str | None]:
     return result_from_value(match.group(1)) if match else (None, None)
 
 
-def parse_channel_result_from_text(text: str) -> tuple[str | None, str | None]:
-    """Parse source-channel results such as `SMALL (2)` or `BIG (3)`."""
-    cleaned = unescape(re.sub(r"<[^>]+>", " ", text or "")).upper()
-    match = re.search(r"\b(BIG|SMALL)\s*\(\s*([0-9])\s*\)", cleaned)
-    if not match:
-        return None, None
-    return match.group(1), match.group(2)
-
-
 async def settle_channel_result(bot, transaction: str, direction: str, actual: str | None):
     """Settle every user's open prediction for an explicitly labelled result post."""
     for user_id, rounds in load_user_rounds().items():
@@ -765,9 +808,34 @@ async def settle_round_now(
     item = get_user_round(user_id, round_id)
     if not item or item.get("result") in {"WIN", "LOSS"}:
         return item
-    # Results are settled only when the matching result post arrives from the
-    # configured Telegram source channel. Never guess a result from a timer.
-    return item
+    direction, actual = await fetch_game_result(item.get("transaction", ""))
+    if not direction:
+        return item
+    result = "WIN" if direction == item.get("signal") else "LOSS"
+    updated = update_user_round(
+        user_id,
+        round_id,
+        status=result,
+        result=result,
+        actual=actual or direction,
+        settled_at=datetime.now(timezone.utc).isoformat(),
+        settled_by="game_history",
+    )
+    settle_signal_history(round_id, result, actual or direction)
+    if updated:
+        message_id = updated.get("message_id")
+        if message_id:
+            try:
+                await bot.edit_message_caption(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    caption=build_round_caption(updated),
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=kb_signal_actions(round_id),
+                )
+            except Exception as error:
+                logger.warning("Could not update settled signal message: %s", error)
+    return updated
 
 
 async def track_round(bot, user_id: int, round_id: str, chat_id: int):
@@ -811,7 +879,22 @@ def parse_signal_from_text(text: str) -> str | None:
         return matches[-1]
     return None
 
-def _parse_public_channel_posts(page: str) -> list[tuple[datetime, str, str | None]]:
+def parse_signal_and_level_from_text(text: str) -> tuple[str | None, int | None]:
+    """Source channel posts e.g. 'BIG (1)' / 'SMALL (3)'. The number in the
+    parentheses is the M2 ladder level for THIS signal (1 = basic amount),
+    and it doubles as the win/loss tell for the PREVIOUS signal:
+      - level == 1  → previous signal WON (ladder reset)
+      - level > 1   → previous signal LOST (ladder moved up)
+    """
+    cleaned = unescape(re.sub(r"<[^>]+>", " ", text)).upper()
+    matches = re.findall(r"\b(BIG|SMALL)\b\s*\(\s*(\d+)\s*\)", cleaned)
+    if matches:
+        direction, level = matches[-1]
+        return direction, int(level)
+    # Fall back to a bare BIG/SMALL with no level tag.
+    return parse_signal_from_text(text), None
+
+def _parse_public_channel_posts(page: str) -> list[tuple[datetime, str, str | None, int | None]]:
     """Extract signal text and its public post time from t.me/s HTML."""
     texts = re.findall(
         r'<div class="tgme_widget_message_text js-message_text"[^>]*>(.*?)</div>',
@@ -819,11 +902,9 @@ def _parse_public_channel_posts(page: str) -> list[tuple[datetime, str, str | No
         flags=re.IGNORECASE | re.DOTALL,
     )
     times = re.findall(r'<time datetime="([^"]+)"', page, flags=re.IGNORECASE)
-    posts: list[tuple[datetime, str, str | None]] = []
+    posts: list[tuple[datetime, str, str | None, int | None]] = []
     for raw_text, raw_time in zip(texts, times):
-        if parse_channel_result_from_text(raw_text)[0]:
-            continue
-        signal = parse_signal_from_text(raw_text)
+        signal, level = parse_signal_and_level_from_text(raw_text)
         if not signal:
             continue
         try:
@@ -836,6 +917,7 @@ def _parse_public_channel_posts(page: str) -> list[tuple[datetime, str, str | No
             post_time.astimezone(timezone.utc),
             signal,
             parse_transaction_from_text(raw_text),
+            level,
         ))
     return posts
 
@@ -853,7 +935,7 @@ async def fetch_latest_public_channel_signal() -> str | None:
         if not posts:
             logger.warning("No BIG/SMALL signal found in public channel preview")
             return None
-        post_time, source_signal, source_transaction = max(posts, key=lambda item: item[0])
+        post_time, source_signal, source_transaction, source_level = max(posts, key=lambda item: item[0])
         age_minutes = (datetime.now(timezone.utc) - post_time).total_seconds() / 60
         if age_minutes > CHANNEL_SIG_MAX_AGE_MIN:
             logger.warning(
@@ -865,6 +947,7 @@ async def fetch_latest_public_channel_signal() -> str | None:
             source_signal,
             source_timestamp=post_time.isoformat(),
             source_transaction=source_transaction,
+            source_level=source_level,
         )
         logger.info(
             "Public channel signal read: %s at %s",
@@ -1106,21 +1189,20 @@ async def _send_text_retry(bot, chat_id: int, text: str, **kwargs):
             await asyncio.sleep(attempt * 2)
 
 
-async def _settle_auto_pending_from_channel(
-    bot, transaction: str, direction: str, actual: str | None,
-) -> None:
-    """Settle Auto Post only from the matching Telegram result post."""
-    config = load_channel_config()
+async def _settle_auto_pending(bot, config: dict, channel_level: int | None) -> bool:
+    """Use the NEW post's own (N) ladder label to settle the PREVIOUS post:
+    (1) means the previous signal WON (ladder reset), any higher number
+    means it LOST (ladder moved up). No website call needed — the source
+    channel already tells us the outcome via its own numbering.
+    Returns True if a pending signal was actually settled."""
     pending = config.get("auto_pending")
-    if (
-        not isinstance(pending, dict)
-        or str(pending.get("transaction", "")).strip() != str(transaction).strip()
-    ):
-        return
+    if not isinstance(pending, dict) or not pending.get("transaction") or not channel_level:
+        return False
+
     config["auto_pending"] = None
     save_channel_config(config)
 
-    if direction == pending.get("signal"):
+    if channel_level == 1:
         streak = mm_register_win()
         file_id = sticker_for_streak(streak)
         if file_id:
@@ -1130,8 +1212,9 @@ async def _settle_auto_pending_from_channel(
                 except Exception as error:
                     logger.warning("Could not send win STK to %s: %s", chat_id, error)
     else:
-        # LOSS: no sticker; advance to the next M2 level.
-        mm_register_loss()
+        # ရှုံးရင် ဘာပုံမှ မပို့ဘဲ M2 ကို channel ရဲ့ (N) အတိုင်း sync လုပ်ပါတယ်။
+        mm_register_loss(channel_level)
+    return True
 
 
 async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1139,8 +1222,6 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     config = load_channel_config()
     if not config.get("auto_post") or not config.get("channels"):
         return
-
-    config = load_channel_config()
 
     source_signal = await fetch_latest_public_channel_signal()
     if not source_signal or not CHANNEL_SIG_FILE.exists():
@@ -1157,6 +1238,19 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     if not targets:
         return
 
+    channel_level = source_data.get("source_level")
+
+    # Settle the previous pending signal using THIS post's (N) label, then
+    # size this new signal's bet the same way — self-syncing every turn.
+    settled = await _settle_auto_pending(context.bot, config, channel_level)
+    config = load_channel_config()
+    if channel_level and not settled:
+        # First post since startup (nothing pending yet) — just sync our
+        # bet level to what the channel is already showing.
+        mm_sync_level(channel_level)
+    elif not channel_level:
+        logger.warning("Channel post had no (N) level tag; using last known M2 level")
+
     # Consume one turn only for a genuinely new source post.
     mode = _next_signal_mode()
     output = (
@@ -1171,6 +1265,7 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     config["auto_pending"] = {
         "transaction": transaction,
         "signal": output,
+        "level": channel_level,
         "amount": amount,
         "sent_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1264,29 +1359,18 @@ async def handle_channel_post(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if (post.chat.username or "").lower() != SIGNAL_CHANNEL.lower():
         return
     post_text = (post.text or post.caption or "").strip()
+    result_direction, actual = parse_result_from_text(post_text)
     transaction = parse_transaction_from_text(post_text)
-    result_direction, actual = parse_channel_result_from_text(post_text)
-    if transaction and result_direction:
-        logger.info(
-            "Telegram result received: transaction=%s result=%s number=%s",
-            transaction, result_direction, actual or "—",
-        )
-        await settle_channel_result(
-            ctx.bot, transaction, result_direction, actual,
-        )
-        await _settle_auto_pending_from_channel(
-            ctx.bot, transaction, result_direction, actual,
-        )
-        return
-    # Signal posts provide source signals only. Result posts never become
-    # signals and are settled above by transaction number.
-    sig = parse_signal_from_text(post_text)
-    if sig:
-        save_channel_signal(
-            sig,
-            source_timestamp=post.date.astimezone(timezone.utc).isoformat(),
-            source_transaction=transaction,
-        )
+    if result_direction and transaction:
+        await settle_channel_result(ctx.bot, transaction, result_direction, actual)
+    else:
+        sig = parse_signal_from_text(post_text)
+        if sig:
+            save_channel_signal(
+                sig,
+                source_timestamp=post.date.astimezone(timezone.utc).isoformat(),
+                source_transaction=parse_transaction_from_text(post_text),
+            )
 
 
 async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
