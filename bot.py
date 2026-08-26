@@ -73,6 +73,10 @@ GAME_HISTORY_URL = os.getenv(
 BASIC_AMOUNT = int(os.getenv("BASIC_AMOUNT", "100") or 100)
 M2_MULTIPLIERS = [1, 2, 5, 11, 25, 55, 130, 300, 650, 1400]
 MM_STATE_FILE = DATA_DIR / "mm_state.json"
+# Win cycle: total 30 win ပြည့်ရင် ခဏရပ်၊ ရွေးထားတဲ့ အချိန် (1H/2H/3H) ပြည့်မှ ပြန်စ။
+WIN_CYCLE_TARGET = int(os.getenv("WIN_CYCLE_TARGET", "30") or 30)
+CYCLE_HOUR_CHOICES = [1, 2, 3]
+DEFAULT_CYCLE_HOURS = 1
 WIN_STK_FILE = DATA_DIR / "win_stickers.json"
 ROUND_SECONDS = 60
 RESULT_GRACE_SECONDS = 8
@@ -372,7 +376,7 @@ def m2_ladder() -> list[int]:
 
 
 def load_mm_state() -> dict:
-    """Money-management state: current M2 level and the live win streak."""
+    """Money-management state: M2 level, cumulative win count and cycle timing."""
     try:
         data = json.loads(MM_STATE_FILE.read_text()) if MM_STATE_FILE.exists() else {}
         if not isinstance(data, dict):
@@ -381,7 +385,13 @@ def load_mm_state() -> dict:
         logger.warning("Could not read money-management state: %s", error)
         data = {}
     data.setdefault("level", 0)
-    data.setdefault("win_streak", 0)
+    # win_count = cycle တစ်ခုအတွင်း အနိုင်အရေအတွက် (ရှုံးလည်း 1 က ပြန်မစပါ)
+    data.setdefault("win_count", int(data.get("win_streak", 0) or 0))
+    data["win_streak"] = data["win_count"]
+    hours = int(data.get("cycle_hours", DEFAULT_CYCLE_HOURS) or DEFAULT_CYCLE_HOURS)
+    data["cycle_hours"] = hours if hours in CYCLE_HOUR_CHOICES else DEFAULT_CYCLE_HOURS
+    data.setdefault("cycle_start", datetime.now(timezone.utc).isoformat())
+    data.setdefault("paused_until", None)
     return data
 
 
@@ -397,20 +407,84 @@ def current_bet() -> int:
     return ladder[min(max(int(level), 0), len(ladder) - 1)]
 
 
-def mm_register_win() -> int:
-    """Win → back to the basic amount, win streak grows. Returns the streak."""
+def get_cycle_hours() -> int:
+    return int(load_mm_state().get("cycle_hours", DEFAULT_CYCLE_HOURS))
+
+
+def set_cycle_hours(hours: int) -> int:
+    """Admin ရွေးလိုက်တဲ့ 1H / 2H / 3H ကို သိမ်းပါတယ်။"""
+    hours = hours if hours in CYCLE_HOUR_CHOICES else DEFAULT_CYCLE_HOURS
     state = load_mm_state()
-    state["level"] = 0
-    state["win_streak"] = int(state.get("win_streak", 0)) + 1
+    state["cycle_hours"] = hours
     save_mm_state(state)
-    return state["win_streak"]
+    return hours
+
+
+def _start_new_cycle(state: dict, started_at: datetime | None = None) -> dict:
+    state["win_count"] = 0
+    state["win_streak"] = 0
+    state["level"] = 0
+    state["paused_until"] = None
+    state["cycle_start"] = (started_at or datetime.now(timezone.utc)).isoformat()
+    save_mm_state(state)
+    return state
+
+
+def mm_maybe_roll_cycle() -> dict:
+    """Cycle အချိန်ပြည့်ရင် (ရပ်ထားသည်/မရပ်သည်) အသစ်ပြန်စပါတယ်။"""
+    state = load_mm_state()
+    now = datetime.now(timezone.utc)
+    hours = int(state.get("cycle_hours", DEFAULT_CYCLE_HOURS))
+    paused_until = _parse_utc(state.get("paused_until")) if state.get("paused_until") else None
+    if paused_until:
+        if now >= paused_until:
+            return _start_new_cycle(state, now)
+        return state
+    cycle_start = _parse_utc(state.get("cycle_start"))
+    if now >= cycle_start + timedelta(hours=hours):
+        return _start_new_cycle(state, now)
+    return state
+
+
+def signals_paused() -> bool:
+    state = mm_maybe_roll_cycle()
+    until = state.get("paused_until")
+    if not until:
+        return False
+    return datetime.now(timezone.utc) < _parse_utc(until)
+
+
+def pause_remaining_seconds() -> int:
+    state = load_mm_state()
+    until = state.get("paused_until")
+    if not until:
+        return 0
+    delta = _parse_utc(until) - datetime.now(timezone.utc)
+    return max(0, int(delta.total_seconds()))
+
+
+def mm_register_win() -> int:
+    """Win → basic amount ပြန်၊ win count တက်သွားမယ် (ရှုံးလည်း 1 က ပြန်မစ)။
+    Total 30 ပြည့်ရင် ရွေးထားတဲ့ အချိန်ပြည့်တဲ့အထိ ခဏရပ်ပါမယ်။"""
+    state = mm_maybe_roll_cycle()
+    state["level"] = 0
+    state["win_count"] = int(state.get("win_count", 0)) + 1
+    state["win_streak"] = state["win_count"]
+    if state["win_count"] >= WIN_CYCLE_TARGET and not state.get("paused_until"):
+        hours = int(state.get("cycle_hours", DEFAULT_CYCLE_HOURS))
+        now = datetime.now(timezone.utc)
+        resume_at = _parse_utc(state.get("cycle_start")) + timedelta(hours=hours)
+        if resume_at <= now:
+            resume_at = now + timedelta(hours=hours)
+        state["paused_until"] = resume_at.isoformat()
+    save_mm_state(state)
+    return state["win_count"]
 
 
 def mm_register_loss() -> int:
-    """Loss → next M2 level, streak resets. Returns the next level index."""
-    state = load_mm_state()
+    """Loss → M2 နောက်အဆင့်။ Win count က မပြောင်း (win 3 ရှုံးရင် နောက် win = 4)။"""
+    state = mm_maybe_roll_cycle()
     state["level"] = min(int(state.get("level", 0)) + 1, len(M2_MULTIPLIERS) - 1)
-    state["win_streak"] = 0
     save_mm_state(state)
     return state["level"]
 
@@ -440,6 +514,7 @@ def add_win_sticker(file_id: str) -> int:
 
 
 def sticker_for_streak(streak: int) -> str | None:
+    """WIN 1..N stickers — win number အတိုင်း (မရှိရင် နောက်ဆုံးတစ်ခု)။"""
     items = load_win_stickers()
     if not items or streak < 1:
         return None
@@ -1062,8 +1137,21 @@ def kb_admin():
          InlineKeyboardButton("📣 Auto Post", callback_data="a_auto_post")],
         [InlineKeyboardButton("🔀 Channel ON/OFF", callback_data="a_channels"),
          InlineKeyboardButton("🖼 Add STK", callback_data="a_add_stk")],
+        [InlineKeyboardButton("⏱ Select Time", callback_data="a_select_time")],
         [InlineKeyboardButton("🔄 Refresh",    callback_data="a_refresh")],
     ])
+
+def kb_select_time():
+    current = get_cycle_hours()
+    row = [
+        InlineKeyboardButton(
+            f"{'✅ ' if current == hours else ''}{hours}H",
+            callback_data=f"a_time:{hours}",
+        )
+        for hours in CYCLE_HOUR_CHOICES
+    ]
+    return InlineKeyboardMarkup([row, [InlineKeyboardButton("🔙 Back", callback_data="a_refresh")]])
+
 
 def kb_channels():
     config = load_channel_config()
@@ -1097,6 +1185,11 @@ def admin_panel_text() -> str:
         if isinstance(item, dict) and item.get("enabled", True)
     ) or "မရှိသေးပါ"
     auto_label = "✅ ON" if config.get("auto_post") else "❌ OFF"
+    mm_state = mm_maybe_roll_cycle()
+    if signals_paused():
+        pause_label = f"⏸ ရပ်ထား ({format_free_time(pause_remaining_seconds())} ကျန်)"
+    else:
+        pause_label = "▶️ Running"
     now_utc   = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
     return (
         "🔧 *FTT Bot — Admin Panel*\n\n"
@@ -1108,7 +1201,9 @@ def admin_panel_text() -> str:
         f"📣 Auto Post         : {auto_label}\n"
         f"📍 Destinations      : {target_label}\n"
         f"💰 Basic / Next Bet  : {BASIC_AMOUNT} / {current_bet()}\n"
-        f"🔥 Win Streak        : {load_mm_state().get('win_streak', 0)}\n"
+        f"🔥 Win Count         : {mm_state.get('win_count', 0)}/{WIN_CYCLE_TARGET}\n"
+        f"⏱ Cycle Time        : {mm_state.get('cycle_hours', DEFAULT_CYCLE_HOURS)}H\n"
+        f"⏸ Status            : {pause_label}\n"
         f"🖼 Win STK Saved     : {len(load_win_stickers())}\n"
         f"🕐 Time (UTC)        : {now_utc}"
     )
@@ -1210,6 +1305,10 @@ async def auto_post_job(context: ContextTypes.DEFAULT_TYPE):
     """Poll the configured public source and publish each new source post once."""
     config = load_channel_config()
     if not config.get("auto_post") or not config.get("channels"):
+        return
+
+    # 30 win ပြည့်ပြီး ခဏရပ်ထားချိန်မှာ signal မပို့ပါ။
+    if signals_paused():
         return
 
     source_signal = await fetch_latest_public_channel_signal()
@@ -1723,6 +1822,31 @@ async def _handle_admin_cb(q, ctx: ContextTypes.DEFAULT_TYPE, data: str):
             "အကုန်ပြီးရင် 🔙 Back နှိပ်ပါ။\n"
             "အားလုံးဖျက်ချင်ရင် `clear` လို့ ရိုက်ပါ။",
             parse_mode=ParseMode.MARKDOWN, reply_markup=kb_back_admin(),
+        )
+
+    elif data == "a_select_time":
+        await q.edit_message_text(
+            "⏱ *Select Time*\n\n"
+            f"လက်ရှိ : *{get_cycle_hours()}H*\n\n"
+            f"Total *{WIN_CYCLE_TARGET} win* ပြည့်ရင် ခဏရပ်ပါမယ်။\n"
+            "ရွေးထားတဲ့ အချိန်ပြည့်မှ win 1 ကနေ ပြန်စပါမယ်။\n"
+            "အချိန်ပြည့်တာနဲ့ (30 မပြည့်လည်း) cycle အသစ် ပြန်စပါမယ်။",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_select_time(),
+        )
+
+    elif data.startswith("a_time:"):
+        try:
+            hours = int(data.split(":", 1)[1])
+        except ValueError:
+            hours = DEFAULT_CYCLE_HOURS
+        set_cycle_hours(hours)
+        await q.answer(f"⏱ {hours}H သတ်မှတ်ပြီးပါပြီ")
+        await q.edit_message_text(
+            "⏱ *Select Time*\n\n"
+            f"လက်ရှိ : *{get_cycle_hours()}H*\n\n"
+            f"Total *{WIN_CYCLE_TARGET} win* ပြည့်ရင် ခဏရပ်ပါမယ်။\n"
+            "ရွေးထားတဲ့ အချိန်ပြည့်မှ win 1 ကနေ ပြန်စပါမယ်။",
+            parse_mode=ParseMode.MARKDOWN, reply_markup=kb_select_time(),
         )
 
     elif data == "a_auto_post":
